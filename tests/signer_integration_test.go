@@ -15,25 +15,25 @@ import (
 
 // TransferRequestBody espelha o [ordered]@{} do teu script PowerShell anexado
 type TransferRequestBody struct {
-	DerivationIndex int    `json:"derivationIndex"`
-	To              string `json:"to"`
-	Amount          string `json:"amount"`
-	TokenContract   string `json:"tokenContract"`
-	IdempotencyKey  string `json:"idempotencyKey"`
+	To             string `json:"to"`
+	Amount         string `json:"amount"`
+	TokenContract  string `json:"tokenContract"`
+	Network        string `json:"network"`
+	IdempotencyKey string `json:"idempotencyKey"`
 }
 
 func TestSigner_HDTransfer_IdenticoAoAnexo(t *testing.T) {
 	// Configurações baseadas no teu .env e script de teste anexado
-	signerURL := "http://localhost:4010" 
+	signerURL := "http://localhost:4010"
 	signerHmacSecret := "69ddb9dcc8bb00afa2406ca2b945fda01934c8310669f3486128ae020ed2088c"
 
 	// 1. Monta o Payload exatamente como o script do PowerShell
 	bodyObj := TransferRequestBody{
-		DerivationIndex: 0,
-		To:              "0x829829508824f81d939F8CFFdCac71dE47a808bE",
-		Amount:          "12.34",
-		TokenContract:   "0xtoken1",
-		IdempotencyKey:  "test-idempotency-123",
+		To:             "0x829829508824f81d939F8CFFdCac71dE47a808bE",
+		Amount:         "12.34",
+		TokenContract:  "0x55d398326f99059fF775485246999027B3197955",
+		Network:        "BSC",
+		IdempotencyKey: "test-idempotency-123",
 	}
 
 	rawBody, err := json.Marshal(bodyObj)
@@ -57,7 +57,7 @@ func TestSigner_HDTransfer_IdenticoAoAnexo(t *testing.T) {
 		// Se o teu segredo for string pura em vez de HEX, use: keyBytes := []byte(signerHmacSecret)
 		keyBytes = []byte(signerHmacSecret)
 	}
-	
+
 	mac := hmac.New(sha256.New, keyBytes)
 	mac.Write(dataToSign.Bytes())
 	sigHex := hex.EncodeToString(mac.Sum(nil))
