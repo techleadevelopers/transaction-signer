@@ -1,0 +1,28 @@
+# Local secrets
+.env
+.env.*
+!.env.example
+
+# Go build outputs
+signer
+signer.exe
+*.exe
+*.test
+*.out
+coverage.out
+
+# Logs and runtime artifacts
+*.log
+*.pid
+tmp/
+dist/
+bin/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Docker / local generated files
+docker-compose.override.yml
