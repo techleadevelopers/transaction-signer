@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"os"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/ethereum/go-ethereum"
@@ -23,69 +22,64 @@ import (
 )
 
 type TransferRequest struct {
-	To             string `json:"to"`
-	Amount         string `json:"amount"`
-	TokenContract  string `json:"tokenContract"`
-	IdempotencyKey string `json:"idempotencyKey"`
+	To              string `json:"to"`
+	Amount          string `json:"amount"`
+	TokenContract   string `json:"tokenContract"`
+	Network         string `json:"network"`
+	IdempotencyKey  string `json:"idempotencyKey"`
+	DerivationIndex *int   `json:"derivationIndex,omitempty"`
 }
 
 type TransferResponse struct {
-	TxHash string `json:"txHash"`
-	From   string `json:"from"`
-}
-
-type replayCache struct {
-	mu      sync.Mutex
-	nonces  map[string]time.Time
-	results map[string]TransferResponse
-}
-
-func newReplayCache() *replayCache {
-	return &replayCache{nonces: make(map[string]time.Time), results: make(map[string]TransferResponse)}
-}
-
-func (c *replayCache) acceptNonce(nonce string, ttl time.Duration) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	now := time.Now()
-	for key, expires := range c.nonces {
-		if now.After(expires) {
-			delete(c.nonces, key)
-		}
-	}
-	if _, exists := c.nonces[nonce]; exists {
-		return false
-	}
-	c.nonces[nonce] = now.Add(ttl)
-	return true
-}
-
-func (c *replayCache) getResult(key string) (TransferResponse, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	resp, ok := c.results[key]
-	return resp, ok
-}
-
-func (c *replayCache) saveResult(key string, resp TransferResponse) {
-	if key == "" {
-		return
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.results[key] = resp
+	TxHash  string `json:"txHash"`
+	From    string `json:"from"`
+	Network string `json:"network"`
 }
 
 func main() {
 	cfg := LoadSignerConfig()
-	if cfg.HMACSecret == "" || cfg.EVMPrivateKey == "" {
-		slog.Error("HMAC_SECRET e EVM_PRIVATE_KEY sao obrigatorios")
+	if cfg.HMACSecret == "" {
+		slog.Error("HMAC_SECRET obrigatorio")
+		os.Exit(1)
+	}
+	if cfg.DefaultNetwork == "TRON" && cfg.TronPrivateKey == "" {
+		slog.Error("TRON_PRIVATE_KEY ou EVM_PRIVATE_KEY obrigatorio para TRON")
+		os.Exit(1)
+	}
+	if (cfg.DefaultNetwork == "BSC" || cfg.DefaultNetwork == "EVM") && cfg.EVMPrivateKey == "" {
+		slog.Error("EVM_PRIVATE_KEY obrigatorio para BSC/EVM")
 		os.Exit(1)
 	}
 
-	cache := newReplayCache()
+	storeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	store, err := openSignerStore(storeCtx, cfg)
+	if err != nil {
+		slog.Error("falha ao abrir storage do signer", "error", err)
+		os.Exit(1)
+	}
+	defer store.Close()
+
 	http.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		writeSignerJSON(w, map[string]any{"ok": true, "service": "signer"})
+	})
+	http.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+		defer cancel()
+		ready := map[string]any{"ok": true, "service": "signer", "network": cfg.DefaultNetwork}
+		if err := store.Ready(ctx); err != nil {
+			ready["ok"] = false
+			ready["storage"] = err.Error()
+		}
+		if cfg.DefaultNetwork == "TRON" && (cfg.TronFullNodeURL == "" || cfg.TronUSDTContract == "") {
+			ready["ok"] = false
+			ready["tron"] = "TRON_FULLNODE_URL e TRON_USDT_CONTRACT obrigatorios"
+		}
+		status := http.StatusOK
+		if ready["ok"] == false {
+			status = http.StatusServiceUnavailable
+		}
+		writeJSONStatus(w, status, ready)
 	})
 	http.HandleFunc("/hd/transfer", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -105,7 +99,13 @@ func main() {
 			http.Error(w, "nao autorizado", http.StatusUnauthorized)
 			return
 		}
-		if !cache.acceptNonce(nonce, time.Duration(cfg.HMACMaxSkewSec)*time.Second) {
+		accepted, err := store.AcceptNonce(r.Context(), nonce, time.Duration(cfg.HMACMaxSkewSec)*time.Second)
+		if err != nil {
+			slog.Error("falha ao persistir nonce", "error", err)
+			http.Error(w, "storage indisponivel", http.StatusServiceUnavailable)
+			return
+		}
+		if !accepted {
 			http.Error(w, "nonce reutilizado", http.StatusUnauthorized)
 			return
 		}
@@ -116,7 +116,13 @@ func main() {
 			return
 		}
 		if req.IdempotencyKey != "" {
-			if previous, ok := cache.getResult(req.IdempotencyKey); ok {
+			previous, ok, err := store.GetResult(r.Context(), req.IdempotencyKey)
+			if err != nil {
+				slog.Error("falha ao consultar idempotencia", "error", err)
+				http.Error(w, "storage indisponivel", http.StatusServiceUnavailable)
+				return
+			}
+			if ok {
 				writeSignerJSON(w, previous)
 				return
 			}
@@ -124,11 +130,15 @@ func main() {
 
 		resp, err := executeTransfer(r.Context(), cfg, req)
 		if err != nil {
-			slog.Error("falha ao executar transferencia", "error", err, "to", req.To)
+			slog.Error("falha ao executar transferencia", "error", err, "network", requestedNetwork(cfg, req), "to", shortValue(req.To))
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
 		}
-		cache.saveResult(req.IdempotencyKey, resp)
+		if err := store.SaveResult(r.Context(), req.IdempotencyKey, resp); err != nil {
+			slog.Error("falha ao salvar idempotencia", "error", err)
+			http.Error(w, "storage indisponivel", http.StatusServiceUnavailable)
+			return
+		}
 		writeSignerJSON(w, resp)
 	})
 
@@ -138,13 +148,31 @@ func main() {
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  60 * time.Second,
 	}
-	slog.Info("signer EVM rodando", "port", cfg.Port)
+	slog.Info("signer rodando", "port", cfg.Port, "network", cfg.DefaultNetwork, "storage", cfg.DatabaseURL != "")
 	if err := server.ListenAndServe(); err != nil {
 		slog.Error("erro ao rodar signer", "error", err)
 	}
 }
 
 func executeTransfer(ctx context.Context, cfg *SignerConfig, req TransferRequest) (TransferResponse, error) {
+	network := requestedNetwork(cfg, req)
+	if err := validateTransferPolicy(cfg, req, network); err != nil {
+		return TransferResponse{}, err
+	}
+	if req.DerivationIndex != nil {
+		return TransferResponse{}, errors.New("derivacao HD ainda nao habilitada para assinatura de hot wallet")
+	}
+	switch network {
+	case "TRON":
+		return executeTronTransfer(ctx, cfg, req)
+	case "BSC", "EVM":
+		return executeEVMTransfer(ctx, cfg, req, network)
+	default:
+		return TransferResponse{}, fmt.Errorf("rede nao suportada: %s", network)
+	}
+}
+
+func executeEVMTransfer(ctx context.Context, cfg *SignerConfig, req TransferRequest, network string) (TransferResponse, error) {
 	privateKey, err := crypto.HexToECDSA(strings.TrimPrefix(cfg.EVMPrivateKey, "0x"))
 	if err != nil {
 		return TransferResponse{}, fmt.Errorf("EVM_PRIVATE_KEY invalida: %w", err)
@@ -152,10 +180,7 @@ func executeTransfer(ctx context.Context, cfg *SignerConfig, req TransferRequest
 	from := crypto.PubkeyToAddress(privateKey.PublicKey)
 	if cfg.AllowSimulation {
 		hash := crypto.Keccak256Hash([]byte(req.IdempotencyKey + req.To + req.Amount)).Hex()
-		return TransferResponse{TxHash: hash, From: from.Hex()}, nil
-	}
-	if !common.IsHexAddress(req.To) {
-		return TransferResponse{}, errors.New("destinatario nao EVM; use signer TRON dedicado ou SIGNER_ALLOW_SIMULATION=true")
+		return TransferResponse{TxHash: hash, From: from.Hex(), Network: network}, nil
 	}
 	to := common.HexToAddress(req.To)
 
@@ -178,8 +203,9 @@ func executeTransfer(ctx context.Context, cfg *SignerConfig, req TransferRequest
 	}
 
 	var tx *types.Transaction
-	token := common.HexToAddress(req.TokenContract)
-	if strings.TrimSpace(req.TokenContract) != "" && token != (common.Address{}) {
+	tokenContract := normalizedTokenContract(cfg, req, network)
+	token := common.HexToAddress(tokenContract)
+	if strings.TrimSpace(tokenContract) != "" && token != (common.Address{}) {
 		amount, err := parseUnits(req.Amount, cfg.TokenDecimals)
 		if err != nil {
 			return TransferResponse{}, err
@@ -209,7 +235,7 @@ func executeTransfer(ctx context.Context, cfg *SignerConfig, req TransferRequest
 	if err := client.SendTransaction(ctx, signed); err != nil {
 		return TransferResponse{}, fmt.Errorf("falha ao transmitir tx: %w", err)
 	}
-	return TransferResponse{TxHash: signed.Hash().Hex(), From: from.Hex()}, nil
+	return TransferResponse{TxHash: signed.Hash().Hex(), From: from.Hex(), Network: network}, nil
 }
 
 func parseUnits(value string, decimals int) (*big.Int, error) {
@@ -256,6 +282,18 @@ func erc20TransferData(to common.Address, amount *big.Int) []byte {
 }
 
 func writeSignerJSON(w http.ResponseWriter, payload any) {
+	writeJSONStatus(w, http.StatusOK, payload)
+}
+
+func writeJSONStatus(w http.ResponseWriter, status int, payload any) {
 	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(payload)
+}
+
+func shortValue(value string) string {
+	if len(value) <= 12 {
+		return value
+	}
+	return value[:6] + "..." + value[len(value)-4:]
 }
