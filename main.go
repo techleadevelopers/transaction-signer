@@ -39,6 +39,10 @@ type TransferResponse struct {
 
 func main() {
 	cfg := LoadSignerConfig()
+	if err := cfg.ValidateProduction(); err != nil {
+		slog.Error("configuracao insegura para producao", "error", err)
+		os.Exit(1)
+	}
 	if cfg.HMACSecret == "" {
 		slog.Error("HMAC_SECRET obrigatorio")
 		os.Exit(1)
@@ -112,21 +116,24 @@ func main() {
 			http.Error(w, "JSON invalido", http.StatusBadRequest)
 			return
 		}
-		if req.IdempotencyKey != "" {
-			previous, ok, err := store.GetResult(r.Context(), req.IdempotencyKey)
-			if err != nil {
-				slog.Error("falha ao consultar idempotencia", "error", err)
-				http.Error(w, "storage indisponivel", http.StatusServiceUnavailable)
-				return
-			}
-			if ok {
-				writeSignerJSON(w, previous)
-				return
-			}
+		previous, done, claimed, err := store.ClaimResult(r.Context(), req.IdempotencyKey)
+		if err != nil {
+			slog.Error("falha ao reservar idempotencia", "error", err)
+			http.Error(w, "storage indisponivel", http.StatusServiceUnavailable)
+			return
+		}
+		if done {
+			writeSignerJSON(w, previous)
+			return
+		}
+		if !claimed {
+			http.Error(w, "idempotency key em processamento", http.StatusConflict)
+			return
 		}
 
 		resp, err := executeTransfer(r.Context(), cfg, req)
 		if err != nil {
+			_ = store.ReleaseClaim(r.Context(), req.IdempotencyKey)
 			slog.Error("falha ao executar transferencia", "error", err, "network", requestedNetwork(cfg, req), "to", shortValue(req.To))
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
