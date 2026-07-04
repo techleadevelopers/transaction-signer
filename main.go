@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/ecdsa"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -42,10 +43,6 @@ func main() {
 		slog.Error("HMAC_SECRET obrigatorio")
 		os.Exit(1)
 	}
-	if cfg.DefaultNetwork == "TRON" && cfg.TronPrivateKey == "" {
-		slog.Error("TRON_PRIVATE_KEY ou EVM_PRIVATE_KEY obrigatorio para TRON")
-		os.Exit(1)
-	}
 	if (cfg.DefaultNetwork == "BSC" || cfg.DefaultNetwork == "EVM") && cfg.EVMPrivateKey == "" {
 		slog.Error("EVM_PRIVATE_KEY obrigatorio para BSC/EVM")
 		os.Exit(1)
@@ -71,9 +68,9 @@ func main() {
 			ready["ok"] = false
 			ready["storage"] = err.Error()
 		}
-		if cfg.DefaultNetwork == "TRON" && (cfg.TronFullNodeURL == "" || cfg.TronUSDTContract == "") {
+		if (cfg.DefaultNetwork == "BSC" || cfg.DefaultNetwork == "EVM") && (len(cfg.RPCURLs) == 0 || cfg.BSCUSDTContract == "") {
 			ready["ok"] = false
-			ready["tron"] = "TRON_FULLNODE_URL e TRON_USDT_CONTRACT obrigatorios"
+			ready["bsc"] = "BSC_RPC_URLS e BSC_USDT_CONTRACT obrigatorios"
 		}
 		status := http.StatusOK
 		if ready["ok"] == false {
@@ -163,8 +160,6 @@ func executeTransfer(ctx context.Context, cfg *SignerConfig, req TransferRequest
 		return TransferResponse{}, errors.New("derivacao HD ainda nao habilitada para assinatura de hot wallet")
 	}
 	switch network {
-	case "TRON":
-		return executeTronTransfer(ctx, cfg, req)
 	case "BSC", "EVM":
 		return executeEVMTransfer(ctx, cfg, req, network)
 	default:
@@ -182,16 +177,42 @@ func executeEVMTransfer(ctx context.Context, cfg *SignerConfig, req TransferRequ
 		hash := crypto.Keccak256Hash([]byte(req.IdempotencyKey + req.To + req.Amount)).Hex()
 		return TransferResponse{TxHash: hash, From: from.Hex(), Network: network}, nil
 	}
-	to := common.HexToAddress(req.To)
-
-	client, err := ethclient.DialContext(ctx, cfg.RPCURL)
-	if err != nil {
-		return TransferResponse{}, fmt.Errorf("RPC indisponivel: %w", err)
+	fleet := cfg.RPCFleet
+	if fleet == nil {
+		fleet = newRPCFleet(cfg.RPCURLs)
 	}
-	defer client.Close()
+	var lastErr error
+	for _, handle := range fleet.sendCandidates(len(cfg.RPCURLs)) {
+		start := time.Now()
+		client, err := ethclient.DialContext(ctx, handle.url)
+		if err != nil {
+			fleet.recordFailure(handle.id, classifyRPCFailure(err))
+			lastErr = fmt.Errorf("%s indisponivel: %w", handle.name, err)
+			continue
+		}
+		resp, err := executeEVMTransferWithClient(ctx, cfg, req, network, client, privateKey, from)
+		client.Close()
+		if err != nil {
+			fleet.recordFailure(handle.id, classifyRPCFailure(err))
+			lastErr = fmt.Errorf("%s falhou: %w", handle.name, err)
+			continue
+		}
+		fleet.recordSuccess(handle.id, time.Since(start))
+		return resp, nil
+	}
+	if lastErr == nil {
+		lastErr = errors.New("nenhum RPC BSC disponivel")
+	}
+	return TransferResponse{}, lastErr
+}
+
+func executeEVMTransferWithClient(ctx context.Context, cfg *SignerConfig, req TransferRequest, network string, client *ethclient.Client, privateKey *ecdsa.PrivateKey, from common.Address) (TransferResponse, error) {
 	chainID, err := client.ChainID(ctx)
 	if err != nil {
 		return TransferResponse{}, fmt.Errorf("falha ao obter chain id: %w", err)
+	}
+	if network == "BSC" && chainID.Cmp(big.NewInt(56)) != 0 {
+		return TransferResponse{}, fmt.Errorf("chain id inesperado para BSC: %s", chainID.String())
 	}
 	nonce, err := client.PendingNonceAt(ctx, from)
 	if err != nil {
@@ -203,6 +224,7 @@ func executeEVMTransfer(ctx context.Context, cfg *SignerConfig, req TransferRequ
 	}
 
 	var tx *types.Transaction
+	to := common.HexToAddress(req.To)
 	tokenContract := normalizedTokenContract(cfg, req, network)
 	token := common.HexToAddress(tokenContract)
 	if strings.TrimSpace(tokenContract) != "" && token != (common.Address{}) {
