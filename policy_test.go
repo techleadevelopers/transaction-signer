@@ -6,21 +6,21 @@ import (
 	"time"
 )
 
-func TestValidateTransferPolicy_TRON(t *testing.T) {
+func TestValidateTransferPolicy_BSC(t *testing.T) {
 	cfg := &SignerConfig{
-		DefaultNetwork:        "TRON",
-		AllowedNetworks:       map[string]bool{"TRON": true},
-		AllowedTokenContracts: map[string]bool{"TR7NHQJEKQXGTCI8Q8ZY4PL8OTSZGJLJ6T": true},
-		TronUSDTContract:      "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t",
+		DefaultNetwork:        "BSC",
+		AllowedNetworks:       map[string]bool{"BSC": true},
+		AllowedTokenContracts: map[string]bool{"0X55D398326F99059FF775485246999027B3197955": true},
+		BSCUSDTContract:       "0x55d398326f99059fF775485246999027B3197955",
 		MaxTransferAmount:     100,
 	}
 	req := TransferRequest{
-		Network: "tron",
-		To:      "TQn9Y2khEsLJW1ChVWFMSMeRDow5KcbLSE",
+		Network: "BSC",
+		To:      "0x829829508824f81d939F8CFFdCac71dE47a808bE",
 		Amount:  "12.34",
 	}
 	if err := validateTransferPolicy(cfg, req, requestedNetwork(cfg, req)); err != nil {
-		t.Fatalf("TRON valido rejeitado: %v", err)
+		t.Fatalf("BSC valido rejeitado: %v", err)
 	}
 }
 
@@ -55,7 +55,7 @@ func TestMemorySignerStore_IdempotencyAndNonce(t *testing.T) {
 	if accepted {
 		t.Fatal("nonce repetido deveria ser bloqueado")
 	}
-	resp := TransferResponse{TxHash: "0xabc", From: "TQn9Y2khEsLJW1ChVWFMSMeRDow5KcbLSE", Network: "TRON"}
+	resp := TransferResponse{TxHash: "0xabc", From: "0x829829508824f81d939F8CFFdCac71dE47a808bE", Network: "BSC"}
 	if err := store.SaveResult(ctx, "buy-1", resp); err != nil {
 		t.Fatal(err)
 	}
