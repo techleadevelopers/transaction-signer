@@ -39,13 +39,6 @@ func validateTransferPolicy(cfg *SignerConfig, req TransferRequest, network stri
 		return errors.New("token contract nao permitido")
 	}
 	switch network {
-	case "TRON":
-		if !isValidTronAddress(req.To) {
-			return errors.New("destinatario TRON invalido")
-		}
-		if token == "" {
-			return errors.New("TRON_USDT_CONTRACT ou tokenContract obrigatorio")
-		}
 	case "BSC", "EVM":
 		if !common.IsHexAddress(req.To) {
 			return errors.New("destinatario EVM invalido")
@@ -61,8 +54,8 @@ func validateTransferPolicy(cfg *SignerConfig, req TransferRequest, network stri
 
 func normalizedTokenContract(cfg *SignerConfig, req TransferRequest, network string) string {
 	token := strings.TrimSpace(req.TokenContract)
-	if network == "TRON" && token == "" {
-		token = cfg.TronUSDTContract
+	if (network == "BSC" || network == "EVM") && token == "" {
+		token = cfg.BSCUSDTContract
 	}
 	return token
 }
