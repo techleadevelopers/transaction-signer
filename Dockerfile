@@ -3,20 +3,20 @@
 
 FROM golang:1.25-bookworm AS builder
 
-WORKDIR /src
+WORKDIR /build
 
-# Copia go.mod e go.sum da raiz
+# Copia go.mod e go.sum (estão na mesma pasta que o Dockerfile)
 COPY go.mod go.sum ./
 RUN go mod download
 
-# Copia TODO o código fonte (porque o signer depende de pacotes internos)
+# Copia TODO o código fonte (está tudo na mesma pasta)
 COPY . .
 
-# Build do signer
+# Build do signer (o main.go está na RAIZ, não em ./signer)
 RUN CGO_ENABLED=0 GOOS=linux go build \
     -trimpath \
     -ldflags="-s -w" \
-    -o /out/signer ./signer
+    -o /out/signer .
 
 FROM debian:bookworm-slim AS runtime
 
