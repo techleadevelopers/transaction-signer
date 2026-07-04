@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -25,6 +26,30 @@ type SignerConfig struct {
 	TokenDecimals         int
 	AllowSimulation       bool
 	Port                  string
+}
+
+func (c *SignerConfig) IsProduction() bool {
+	env := strings.ToLower(strings.TrimSpace(c.AppEnv))
+	return env == "production" || env == "prod"
+}
+
+func (c *SignerConfig) ValidateProduction() error {
+	if !c.IsProduction() {
+		return nil
+	}
+	if c.AllowSimulation {
+		return fmt.Errorf("SIGNER_ALLOW_SIMULATION deve ser false em producao")
+	}
+	if strings.TrimSpace(c.DatabaseURL) == "" {
+		return fmt.Errorf("SIGNER_DATABASE_URL ou DATABASE_URL obrigatorio em producao")
+	}
+	if len(c.AllowedTokenContracts) == 0 {
+		return fmt.Errorf("SIGNER_ALLOWED_TOKEN_CONTRACTS deve fixar contratos permitidos em producao")
+	}
+	if len(strings.TrimSpace(c.HMACSecret)) < 32 {
+		return fmt.Errorf("HMAC_SECRET deve ter pelo menos 32 caracteres em producao")
+	}
+	return nil
 }
 
 func LoadSignerConfig() *SignerConfig {
