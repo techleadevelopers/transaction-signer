@@ -25,14 +25,14 @@ PORT=4010
 APP_ENV=production
 HMAC_SECRET=mesmo-valor-usado-no-core-como-SIGNER_HMAC_SECRET
 SIGNER_DATABASE_URL=postgres://...
-SIGNER_NETWORK=TRON
-SIGNER_ALLOWED_NETWORKS=TRON,BSC
-SIGNER_ALLOWED_TOKEN_CONTRACTS=TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t,0x55d398326f99059fF775485246999027B3197955
+SIGNER_NETWORK=BSC
+SIGNER_ALLOWED_NETWORKS=BSC,BSC
+SIGNER_ALLOWED_TOKEN_CONTRACTS=0x55d398326f99059fF775485246999027B3197955,0x55d398326f99059fF775485246999027B3197955
 SIGNER_MAX_TRANSFER_AMOUNT=10000
-TRON_PRIVATE_KEY=0x...
-TRON_FULLNODE_URL=https://api.trongrid.io
-TRON_USDT_CONTRACT=TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t
-TRON_USDT_DECIMALS=6
+BSC_PRIVATE_KEY=0x...
+BSC_FULLNODE_URL=https://api.BSCgrid.io
+BSC_USDT_CONTRACT=0x55d398326f99059fF775485246999027B3197955
+BSC_USDT_DECIMALS=6
 EVM_PRIVATE_KEY=0x...
 RPC_URL=https://...
 SIGNER_TOKEN_DECIMALS=18
@@ -52,12 +52,12 @@ SIGNER_URL=https://url-privada-ou-publica-do-signer
 SIGNER_HMAC_SECRET=mesmo-valor-do-HMAC_SECRET
 ```
 
-Nota: o signer atual assina TRON/TRC20 e BSC/EVM no endpoint `POST /hd/transfer`, com `network` no payload. O campo `derivationIndex` fica bloqueado por padrão na hot wallet; sweep HD deve usar signer dedicado e política própria.
+Nota: o signer atual assina BSC/BEP20 e BSC/EVM no endpoint `POST /hd/transfer`, com `network` no payload. O campo `derivationIndex` fica bloqueado por padrão na hot wallet; sweep HD deve usar signer dedicado e política própria.
 
-# Swappy BSC/TRON Core Signer 🛡️
+# Swappy BSC/BSC Core Signer 🛡️
 ### Motor de Assinatura Criptográfica de Alta Performance e Isolamento de Chaves em Go
 
-O `signer` é um microsserviço isolado de infraestrutura crítica (isolado do Core público da API) responsável unicamente por gerenciar chaves privadas, derivar carteiras e assinar transações on-chain (EVM/TRON) para liquidação de ordens de compra (*Buy/Send*) e varreduras automáticas de depósitos (*Sweeping*).
+O `signer` é um microsserviço isolado de infraestrutura crítica (isolado do Core público da API) responsável unicamente por gerenciar chaves privadas, derivar carteiras e assinar transações on-chain (EVM/BSC) para liquidação de ordens de compra (*Buy/Send*) e varreduras automáticas de depósitos (*Sweeping*).
 
 ---
 
