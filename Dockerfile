@@ -1,14 +1,18 @@
+# signer/Dockerfile
 # syntax=docker/dockerfile:1
 
 FROM golang:1.25-bookworm AS builder
 
 WORKDIR /src
 
+# Copia go.mod e go.sum da raiz
 COPY go.mod go.sum ./
 RUN go mod download
 
-COPY signer ./signer
+# Copia TODO o código fonte (porque o signer depende de pacotes internos)
+COPY . .
 
+# Build do signer
 RUN CGO_ENABLED=0 GOOS=linux go build \
     -trimpath \
     -ldflags="-s -w" \
