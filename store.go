@@ -13,8 +13,10 @@ import (
 
 type signerStore interface {
 	AcceptNonce(ctx context.Context, nonce string, ttl time.Duration) (bool, error)
+	ClaimResult(ctx context.Context, key string) (TransferResponse, bool, bool, error)
 	GetResult(ctx context.Context, key string) (TransferResponse, bool, error)
 	SaveResult(ctx context.Context, key string, resp TransferResponse) error
+	ReleaseClaim(ctx context.Context, key string) error
 	Ready(ctx context.Context) error
 	Close() error
 }
@@ -57,6 +59,10 @@ func (s *postgresSignerStore) migrate(ctx context.Context) error {
 			response JSONB NOT NULL,
 			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		);
+		CREATE TABLE IF NOT EXISTS signer_idempotency_locks (
+			idempotency_key TEXT PRIMARY KEY,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+		);
 		CREATE INDEX IF NOT EXISTS idx_signer_nonces_expires_at ON signer_nonces (expires_at);
 	`)
 	return err
@@ -96,6 +102,25 @@ func (s *postgresSignerStore) GetResult(ctx context.Context, key string) (Transf
 	return resp, true, nil
 }
 
+func (s *postgresSignerStore) ClaimResult(ctx context.Context, key string) (TransferResponse, bool, bool, error) {
+	if key == "" {
+		return TransferResponse{}, false, true, nil
+	}
+	if resp, ok, err := s.GetResult(ctx, key); err != nil || ok {
+		return resp, ok, false, err
+	}
+	res, err := s.db.ExecContext(ctx,
+		`INSERT INTO signer_idempotency_locks (idempotency_key) VALUES ($1) ON CONFLICT DO NOTHING`, key)
+	if err != nil {
+		return TransferResponse{}, false, false, err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return TransferResponse{}, false, false, err
+	}
+	return TransferResponse{}, false, rows == 1, nil
+}
+
 func (s *postgresSignerStore) SaveResult(ctx context.Context, key string, resp TransferResponse) error {
 	if key == "" {
 		return nil
@@ -104,9 +129,28 @@ func (s *postgresSignerStore) SaveResult(ctx context.Context, key string, resp T
 	if err != nil {
 		return err
 	}
-	_, err = s.db.ExecContext(ctx,
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	_, err = tx.ExecContext(ctx,
 		`INSERT INTO signer_idempotency (idempotency_key, response) VALUES ($1, $2) ON CONFLICT (idempotency_key) DO NOTHING`,
 		key, raw)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM signer_idempotency_locks WHERE idempotency_key = $1`, key); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *postgresSignerStore) ReleaseClaim(ctx context.Context, key string) error {
+	if key == "" {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `DELETE FROM signer_idempotency_locks WHERE idempotency_key = $1`, key)
 	return err
 }
 
@@ -122,10 +166,11 @@ type memorySignerStore struct {
 	mu      sync.Mutex
 	nonces  map[string]time.Time
 	results map[string]TransferResponse
+	locks   map[string]struct{}
 }
 
 func newMemorySignerStore() *memorySignerStore {
-	return &memorySignerStore{nonces: make(map[string]time.Time), results: make(map[string]TransferResponse)}
+	return &memorySignerStore{nonces: make(map[string]time.Time), results: make(map[string]TransferResponse), locks: make(map[string]struct{})}
 }
 
 func (s *memorySignerStore) AcceptNonce(_ context.Context, nonce string, ttl time.Duration) (bool, error) {
@@ -151,6 +196,22 @@ func (s *memorySignerStore) GetResult(_ context.Context, key string) (TransferRe
 	return resp, ok, nil
 }
 
+func (s *memorySignerStore) ClaimResult(_ context.Context, key string) (TransferResponse, bool, bool, error) {
+	if key == "" {
+		return TransferResponse{}, false, true, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if resp, ok := s.results[key]; ok {
+		return resp, true, false, nil
+	}
+	if _, locked := s.locks[key]; locked {
+		return TransferResponse{}, false, false, nil
+	}
+	s.locks[key] = struct{}{}
+	return TransferResponse{}, false, true, nil
+}
+
 func (s *memorySignerStore) SaveResult(_ context.Context, key string, resp TransferResponse) error {
 	if key == "" {
 		return nil
@@ -158,6 +219,17 @@ func (s *memorySignerStore) SaveResult(_ context.Context, key string, resp Trans
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.results[key] = resp
+	delete(s.locks, key)
+	return nil
+}
+
+func (s *memorySignerStore) ReleaseClaim(_ context.Context, key string) error {
+	if key == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.locks, key)
 	return nil
 }
 
