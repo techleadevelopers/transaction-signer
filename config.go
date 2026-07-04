@@ -11,11 +11,10 @@ import (
 type SignerConfig struct {
 	AppEnv                string
 	EVMPrivateKey         string
-	TronPrivateKey        string
 	RPCURL                string
-	TronFullNodeURL       string
-	TronUSDTContract      string
-	TronFeeLimitSun       int64
+	RPCURLs               []string
+	RPCFleet              *rpcFleet
+	BSCUSDTContract       string
 	DefaultNetwork        string
 	AllowedNetworks       map[string]bool
 	AllowedTokenContracts map[string]bool
@@ -24,7 +23,6 @@ type SignerConfig struct {
 	HMACSecret            string
 	HMACMaxSkewSec        int
 	TokenDecimals         int
-	TronTokenDecimals     int
 	AllowSimulation       bool
 	Port                  string
 }
@@ -32,26 +30,54 @@ type SignerConfig struct {
 func LoadSignerConfig() *SignerConfig {
 	_ = godotenv.Load()
 
+	rpcURLs := parseRPCURLs()
 	return &SignerConfig{
 		AppEnv:                strings.ToLower(getEnv("APP_ENV", getEnv("ENV", "development"))),
 		EVMPrivateKey:         getEnv("EVM_PRIVATE_KEY", ""),
-		TronPrivateKey:        getEnv("TRON_PRIVATE_KEY", getEnv("EVM_PRIVATE_KEY", "")),
 		RPCURL:                getEnv("RPC_URL", "https://bsc-dataseed.binance.org/"),
-		TronFullNodeURL:       strings.TrimRight(getEnv("TRON_FULLNODE_URL", "https://api.trongrid.io"), "/"),
-		TronUSDTContract:      getEnv("TRON_USDT_CONTRACT", ""),
-		TronFeeLimitSun:       int64(getEnvAsInt("TRON_FEE_LIMIT_SUN", 30_000_000)),
-		DefaultNetwork:        strings.ToUpper(getEnv("SIGNER_NETWORK", "TRON")),
-		AllowedNetworks:       parseSet(getEnv("SIGNER_ALLOWED_NETWORKS", "TRON,BSC,EVM")),
+		RPCURLs:               rpcURLs,
+		RPCFleet:              newRPCFleet(rpcURLs),
+		BSCUSDTContract:       getEnv("BSC_USDT_CONTRACT", getEnv("BSC_TOKEN_CONTRACT", "")),
+		DefaultNetwork:        strings.ToUpper(getEnv("SIGNER_NETWORK", "BSC")),
+		AllowedNetworks:       parseSet(getEnv("SIGNER_ALLOWED_NETWORKS", "BSC,EVM")),
 		AllowedTokenContracts: parseSet(getEnv("SIGNER_ALLOWED_TOKEN_CONTRACTS", "")),
 		MaxTransferAmount:     getEnvAsFloat("SIGNER_MAX_TRANSFER_AMOUNT", 10000),
 		DatabaseURL:           getEnv("SIGNER_DATABASE_URL", getEnv("DATABASE_URL", "")),
 		HMACSecret:            getEnv("HMAC_SECRET", ""),
 		HMACMaxSkewSec:        getEnvAsInt("HMAC_MAX_SKEW_SEC", 60),
 		TokenDecimals:         getEnvAsInt("SIGNER_TOKEN_DECIMALS", 18),
-		TronTokenDecimals:     getEnvAsInt("TRON_USDT_DECIMALS", 6),
 		AllowSimulation:       getEnvAsBool("SIGNER_ALLOW_SIMULATION", false),
 		Port:                  getEnv("PORT", "4010"),
 	}
+}
+
+func parseRPCURLs() []string {
+	raw := firstNonEmptyEnv("BSC_RPC_URLS", "RPC_URLS", "RPC_URL")
+	var urls []string
+	for _, item := range strings.Split(raw, ",") {
+		url := strings.TrimSpace(item)
+		if url != "" {
+			urls = append(urls, url)
+		}
+	}
+	for _, key := range []string{"ALCHEMY_BSC_RPC_URL_1", "ALCHEMY_BSC_RPC_URL_2", "ALCHEMY_BSC_RPC_URL", "ALCHEMY_BSC_FALLBACK_RPC_URL"} {
+		if url := strings.TrimSpace(getEnv(key, "")); url != "" {
+			urls = append(urls, url)
+		}
+	}
+	if len(urls) == 0 {
+		urls = append(urls, "https://bsc-dataseed.binance.org/")
+	}
+	return urls
+}
+
+func firstNonEmptyEnv(keys ...string) string {
+	for _, key := range keys {
+		if value := strings.TrimSpace(getEnv(key, "")); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func getEnv(key, defaultValue string) string {
