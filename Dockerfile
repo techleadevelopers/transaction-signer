@@ -1,21 +1,19 @@
-# signer/Dockerfile (dentro da pasta signer/)
-
 FROM golang:1.25-bookworm AS builder
 
 WORKDIR /build
 
-# O go.mod está na RAIZ do payment-gateway (um nível acima)
-COPY ../go.mod ../go.sum ./
+# go.mod está na MESMA pasta que o Dockerfile
+COPY go.mod go.sum ./
 RUN go mod download
 
-# Copia TODO o projeto (porque o signer pode depender de pacotes internos)
-COPY .. .
+# Copia tudo (só a pasta signer)
+COPY . .
 
-# Build do signer - ele está em ./signer/
+# Build (main.go está na raiz)
 RUN CGO_ENABLED=0 GOOS=linux go build \
     -trimpath \
     -ldflags="-s -w" \
-    -o /out/signer ./signer
+    -o /out/signer .
 
 FROM debian:bookworm-slim
 
