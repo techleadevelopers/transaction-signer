@@ -5,14 +5,12 @@ FROM golang:1.25-bookworm AS builder
 
 WORKDIR /build
 
-# Copia go.mod e go.sum (estão na mesma pasta que o Dockerfile)
 COPY go.mod go.sum ./
 RUN go mod download
 
-# Copia TODO o código fonte (está tudo na mesma pasta)
 COPY . .
 
-# Build do signer (o main.go está na RAIZ, não em ./signer)
+# Build do signer - o binário vai ser chamado de "signer"
 RUN CGO_ENABLED=0 GOOS=linux go build \
     -trimpath \
     -ldflags="-s -w" \
@@ -27,6 +25,8 @@ RUN apt-get update \
 
 WORKDIR /app
 
+# O binário "/out/signer" vai ser copiado como "/app/signer"
+# O nome do arquivo é "signer", não tem pasta signer/
 COPY --from=builder /out/signer /app/signer
 
 ENV PORT=4010
