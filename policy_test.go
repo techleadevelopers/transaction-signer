@@ -67,3 +67,47 @@ func TestMemorySignerStore_IdempotencyAndNonce(t *testing.T) {
 		t.Fatalf("resultado incorreto: %+v", got)
 	}
 }
+
+func TestMemorySignerStore_ClaimBlocksConcurrentIdempotency(t *testing.T) {
+	store := newMemorySignerStore()
+	ctx := context.Background()
+
+	_, done, claimed, err := store.ClaimResult(ctx, "buy-1")
+	if err != nil || done || !claimed {
+		t.Fatalf("first claim should reserve key: done=%v claimed=%v err=%v", done, claimed, err)
+	}
+	_, done, claimed, err = store.ClaimResult(ctx, "buy-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if done || claimed {
+		t.Fatalf("second claim should be blocked while in progress: done=%v claimed=%v", done, claimed)
+	}
+
+	resp := TransferResponse{TxHash: "0xabc", From: "0x829829508824f81d939F8CFFdCac71dE47a808bE", Network: "BSC"}
+	if err := store.SaveResult(ctx, "buy-1", resp); err != nil {
+		t.Fatal(err)
+	}
+	got, done, claimed, err := store.ClaimResult(ctx, "buy-1")
+	if err != nil || !done || claimed || got.TxHash != resp.TxHash {
+		t.Fatalf("completed key should return previous result: got=%+v done=%v claimed=%v err=%v", got, done, claimed, err)
+	}
+}
+
+func TestSignerValidateProductionRequiresTokenAllowlist(t *testing.T) {
+	cfg := &SignerConfig{
+		AppEnv:          "production",
+		DatabaseURL:     "postgres://user:pass@localhost/db",
+		AllowSimulation: false,
+		Security: SecurityConfig{
+			HMACSecret:  "0123456789abcdef0123456789abcdef",
+			RequireHMAC: true,
+		},
+		AllowedNetworks:   map[string]bool{"BSC": true},
+		BSCUSDTContract:   "0x55d398326f99059fF775485246999027B3197955",
+		MaxTransferAmount: 100,
+	}
+	if err := cfg.ValidateProduction(); err == nil {
+		t.Fatal("expected missing token allowlist to fail production validation")
+	}
+}
