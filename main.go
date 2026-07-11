@@ -12,8 +12,11 @@ import (
 	"math/big"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
+
+	"payment-gateway/internal/security"
 
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
@@ -43,7 +46,12 @@ func main() {
 		slog.Error("configuracao insegura para producao", "error", err)
 		os.Exit(1)
 	}
-	if cfg.HMACSecret == "" {
+
+	// ===== NOVO: Configurar Security =====
+	_, middleware := setupSecurity(cfg)
+
+	// Validações existentes
+	if cfg.Security.HMACSecret == "" {
 		slog.Error("HMAC_SECRET obrigatorio")
 		os.Exit(1)
 	}
@@ -61,13 +69,48 @@ func main() {
 	}
 	defer store.Close()
 
-	http.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+	custodyGuard, err := NewCustodyGuard(cfg, store)
+	if err != nil && cfg.CustodyGuardEnabled {
+		slog.Error("falha ao inicializar custody guard", "error", err)
+		os.Exit(1)
+	}
+	if custodyGuard != nil && custodyGuard.Enabled() {
+		go custodyGuard.Start(context.Background())
+	}
+	if !cfg.AllowSimulation {
+		go startTxLifecycleMonitor(context.Background(), cfg, store)
+	}
+
+	// ===== ROTAS =====
+	mux := http.NewServeMux()
+
+	// Rotas públicas (sem autenticação)
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		writeSignerJSON(w, map[string]any{"ok": true, "service": "signer"})
 	})
-	http.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 		defer cancel()
-		ready := map[string]any{"ok": true, "service": "signer", "network": cfg.DefaultNetwork}
+		locked, lockReason := custodyGuard.Locked()
+		ready := map[string]any{
+			"ok":           !locked,
+			"service":      "signer",
+			"network":      cfg.DefaultNetwork,
+			"custodyGuard": cfg.CustodyGuardEnabled,
+			"custodyMode":  cfg.CustodyMode,
+			"lockdown":     locked,
+			"treasury": map[string]any{
+				"minUSDT":              cfg.TreasuryMinUSDT,
+				"targetUSDT":           cfg.TreasuryTargetUSDT,
+				"maxUSDT":              cfg.TreasuryMaxUSDT,
+				"maxDailyOutflow":      cfg.TreasuryMaxDailyOut,
+				"lockdownDailyOutflow": cfg.TreasuryLockThreshold,
+			},
+		}
+		if locked {
+			ready["lockReason"] = lockReason
+		}
 		if err := store.Ready(ctx); err != nil {
 			ready["ok"] = false
 			ready["storage"] = err.Error()
@@ -82,32 +125,87 @@ func main() {
 		}
 		writeJSONStatus(w, status, ready)
 	})
-	http.HandleFunc("/hd/transfer", func(w http.ResponseWriter, r *http.Request) {
+
+	// ===== ROTAS PROTEGIDAS (com middleware) =====
+	mux.Handle("/custody/unlock", middleware.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "metodo nao permitido", http.StatusMethodNotAllowed)
 			return
 		}
-		ts := r.Header.Get("x-ts")
-		nonce := r.Header.Get("x-nonce")
-		hmacHeader := r.Header.Get("x-signer-hmac")
+
+		// Recupera contexto da requisição (já validado pelo middleware)
+		reqCtx := security.GetRequestContext(r.Context())
+		if reqCtx == nil {
+			http.Error(w, "contexto nao encontrado", http.StatusInternalServerError)
+			return
+		}
+
+		// Lê body (já validado pelo middleware)
 		body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 		if err != nil {
 			http.Error(w, "erro ao ler body", http.StatusBadRequest)
 			return
 		}
-		if err := ValidateHMAC(cfg.HMACSecret, cfg.HMACMaxSkewSec, ts, nonce, hmacHeader, body); err != nil {
-			slog.Warn("HMAC rejeitado", "error", err)
-			http.Error(w, "nao autorizado", http.StatusUnauthorized)
+
+		// Nonce já foi validado pelo middleware, mas ainda precisamos verificar no store
+		// O middleware já validou o HMAC e o Nonce, mas precisamos persistir o nonce no store
+		// para anti-replay entre instâncias
+		accepted, err := store.AcceptNonce(r.Context(), reqCtx.Nonce, cfg.GetNonceTTL())
+		if err != nil {
+			http.Error(w, "storage indisponivel", http.StatusServiceUnavailable)
 			return
 		}
-		accepted, err := store.AcceptNonce(r.Context(), nonce, time.Duration(cfg.HMACMaxSkewSec)*time.Second)
+		if !accepted {
+			http.Error(w, "nonce ja utilizado", http.StatusUnauthorized)
+			return
+		}
+
+		var payload struct {
+			Note string `json:"note"`
+		}
+		_ = json.Unmarshal(body, &payload)
+		if err := custodyGuard.Unlock(r.Context(), payload.Note); err != nil {
+			http.Error(w, err.Error(), http.StatusLocked)
+			return
+		}
+		writeSignerJSON(w, map[string]any{"ok": true, "lockdown": false, "requestId": reqCtx.RequestID})
+	})))
+
+	mux.Handle("/hd/transfer", middleware.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "metodo nao permitido", http.StatusMethodNotAllowed)
+			return
+		}
+
+		if locked, reason := custodyGuard.Locked(); locked {
+			slog.Error("transferencia bloqueada por custody guard", "reason", reason)
+			http.Error(w, "custody guard lockdown", http.StatusLocked)
+			return
+		}
+
+		// Recupera contexto da requisição (já validado pelo middleware)
+		reqCtx := security.GetRequestContext(r.Context())
+		if reqCtx == nil {
+			http.Error(w, "contexto nao encontrado", http.StatusInternalServerError)
+			return
+		}
+
+		// Lê body (já validado pelo middleware)
+		body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		if err != nil {
+			http.Error(w, "erro ao ler body", http.StatusBadRequest)
+			return
+		}
+
+		// Persiste nonce no store (anti-replay entre instâncias)
+		accepted, err := store.AcceptNonce(r.Context(), reqCtx.Nonce, cfg.GetNonceTTL())
 		if err != nil {
 			slog.Error("falha ao persistir nonce", "error", err)
 			http.Error(w, "storage indisponivel", http.StatusServiceUnavailable)
 			return
 		}
 		if !accepted {
-			http.Error(w, "nonce reutilizado", http.StatusUnauthorized)
+			http.Error(w, "nonce ja utilizado", http.StatusUnauthorized)
 			return
 		}
 
@@ -116,6 +214,15 @@ func main() {
 			http.Error(w, "JSON invalido", http.StatusBadRequest)
 			return
 		}
+
+		// Log com RequestID
+		slog.Info("transferencia recebida",
+			"requestId", reqCtx.RequestID,
+			"to", shortValue(req.To),
+			"amount", req.Amount,
+			"network", requestedNetwork(cfg, req),
+		)
+
 		previous, done, claimed, err := store.ClaimResult(r.Context(), req.IdempotencyKey)
 		if err != nil {
 			slog.Error("falha ao reservar idempotencia", "error", err)
@@ -131,10 +238,15 @@ func main() {
 			return
 		}
 
-		resp, err := executeTransfer(r.Context(), cfg, req)
+		resp, err := executeTransfer(r.Context(), cfg, store, req)
 		if err != nil {
 			_ = store.ReleaseClaim(r.Context(), req.IdempotencyKey)
-			slog.Error("falha ao executar transferencia", "error", err, "network", requestedNetwork(cfg, req), "to", shortValue(req.To))
+			slog.Error("falha ao executar transferencia",
+				"error", err,
+				"requestId", reqCtx.RequestID,
+				"network", requestedNetwork(cfg, req),
+				"to", shortValue(req.To),
+			)
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
 		}
@@ -144,23 +256,81 @@ func main() {
 			return
 		}
 		writeSignerJSON(w, resp)
-	})
+	})))
 
 	server := &http.Server{
 		Addr:         ":" + cfg.Port,
+		Handler:      mux,
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  60 * time.Second,
 	}
-	slog.Info("signer rodando", "port", cfg.Port, "network", cfg.DefaultNetwork, "storage", cfg.DatabaseURL != "")
+
+	slog.Info("signer rodando",
+		"port", cfg.Port,
+		"network", cfg.DefaultNetwork,
+		"storage", cfg.DatabaseURL != "",
+		"hmac", cfg.Security.HMACSecret != "",
+		"nonce", cfg.Security.NonceTTLSeconds,
+		"rateLimit", cfg.Security.RateLimitPerMin,
+	)
+
 	if err := server.ListenAndServe(); err != nil {
 		slog.Error("erro ao rodar signer", "error", err)
 	}
 }
 
-func executeTransfer(ctx context.Context, cfg *SignerConfig, req TransferRequest) (TransferResponse, error) {
+// ===== NOVA FUNÇÃO: setupSecurity =====
+func setupSecurity(cfg *SignerConfig) (*security.RequestValidator, *security.Middleware) {
+	// Configura Nonce Store
+	var nonceStore security.NonceStore
+	switch cfg.Security.NonceStoreType {
+	case "redis":
+		// Se tiver Redis configurado
+		// nonceStore = security.NewRedisNonceStore(redisClient)
+		// Por enquanto, fallback para memory
+		slog.Warn("Redis nonce store não implementado, usando memory", "storeType", cfg.Security.NonceStoreType)
+		nonceStore = security.NewInMemoryNonceStore()
+	default:
+		nonceStore = security.NewInMemoryNonceStore()
+	}
+
+	// Configura Validador
+	validatorConfig := security.RequestValidatorConfig{
+		HMACSecret:      cfg.Security.HMACSecret,
+		HMACMaxSkew:     cfg.Security.HMACMaxSkewSec,
+		NonceStore:      nonceStore,
+		NonceTTL:        cfg.GetNonceTTL(),
+		RateLimit:       cfg.GetRateLimit(),
+		RateWindow:      cfg.GetRateWindow(),
+		RateLimiterType: security.RateLimiterType(cfg.GetRateLimiterType()),
+		MaxBodySize:     cfg.GetMaxBodySize(),
+		OldSecret:       cfg.Security.HMACOldSecret,
+	}
+
+	validator := security.NewRequestValidator(validatorConfig)
+
+	// Configura Middleware
+	middleware := security.NewMiddleware(validator, security.SecurityOptions{
+		Enabled:        true,
+		RequireHMAC:    cfg.Security.RequireHMAC,
+		RequireNonce:   cfg.Security.RequireNonce,
+		RequireAPIKey:  cfg.Security.RequireAPIKey,
+		ExcludePaths:   []string{"/healthz", "/readyz"},
+		AllowedMethods: []string{"POST", "GET"},
+	})
+
+	return validator, middleware
+}
+
+// ===== Funções existentes (mantidas) =====
+
+func executeTransfer(ctx context.Context, cfg *SignerConfig, store signerStore, req TransferRequest) (TransferResponse, error) {
 	network := requestedNetwork(cfg, req)
 	if err := validateTransferPolicy(cfg, req, network); err != nil {
+		return TransferResponse{}, err
+	}
+	if err := validateTreasuryPolicy(ctx, cfg, store, req, network); err != nil {
 		return TransferResponse{}, err
 	}
 	if req.DerivationIndex != nil {
@@ -168,13 +338,13 @@ func executeTransfer(ctx context.Context, cfg *SignerConfig, req TransferRequest
 	}
 	switch network {
 	case "BSC", "EVM":
-		return executeEVMTransfer(ctx, cfg, req, network)
+		return executeEVMTransfer(ctx, cfg, store, req, network)
 	default:
 		return TransferResponse{}, fmt.Errorf("rede nao suportada: %s", network)
 	}
 }
 
-func executeEVMTransfer(ctx context.Context, cfg *SignerConfig, req TransferRequest, network string) (TransferResponse, error) {
+func executeEVMTransfer(ctx context.Context, cfg *SignerConfig, store signerStore, req TransferRequest, network string) (TransferResponse, error) {
 	privateKey, err := crypto.HexToECDSA(strings.TrimPrefix(cfg.EVMPrivateKey, "0x"))
 	if err != nil {
 		return TransferResponse{}, fmt.Errorf("EVM_PRIVATE_KEY invalida: %w", err)
@@ -197,7 +367,7 @@ func executeEVMTransfer(ctx context.Context, cfg *SignerConfig, req TransferRequ
 			lastErr = fmt.Errorf("%s indisponivel: %w", handle.name, err)
 			continue
 		}
-		resp, err := executeEVMTransferWithClient(ctx, cfg, req, network, client, privateKey, from)
+		resp, err := executeEVMTransferWithClient(ctx, cfg, store, req, network, client, privateKey, from)
 		client.Close()
 		if err != nil {
 			fleet.recordFailure(handle.id, classifyRPCFailure(err))
@@ -213,7 +383,7 @@ func executeEVMTransfer(ctx context.Context, cfg *SignerConfig, req TransferRequ
 	return TransferResponse{}, lastErr
 }
 
-func executeEVMTransferWithClient(ctx context.Context, cfg *SignerConfig, req TransferRequest, network string, client *ethclient.Client, privateKey *ecdsa.PrivateKey, from common.Address) (TransferResponse, error) {
+func executeEVMTransferWithClient(ctx context.Context, cfg *SignerConfig, store signerStore, req TransferRequest, network string, client *ethclient.Client, privateKey *ecdsa.PrivateKey, from common.Address) (TransferResponse, error) {
 	chainID, err := client.ChainID(ctx)
 	if err != nil {
 		return TransferResponse{}, fmt.Errorf("falha ao obter chain id: %w", err)
@@ -221,10 +391,15 @@ func executeEVMTransferWithClient(ctx context.Context, cfg *SignerConfig, req Tr
 	if network == "BSC" && chainID.Cmp(big.NewInt(56)) != 0 {
 		return TransferResponse{}, fmt.Errorf("chain id inesperado para BSC: %s", chainID.String())
 	}
-	nonce, err := client.PendingNonceAt(ctx, from)
+	chainPending, err := client.PendingNonceAt(ctx, from)
 	if err != nil {
 		return TransferResponse{}, fmt.Errorf("falha ao obter nonce: %w", err)
 	}
+	nonce, err := store.ReserveChainNonce(ctx, from.Hex(), network, chainPending)
+	if err != nil {
+		return TransferResponse{}, fmt.Errorf("falha ao reservar nonce: %w", err)
+	}
+	_ = store.RecordCustodyEvent(ctx, CustodyEvent{Kind: "nonce_reserved", Mode: cfg.CustodyMode, Wallet: from.Hex(), Data: map[string]any{"nonce": nonce, "network": network}})
 	gasPrice, err := client.SuggestGasPrice(ctx)
 	if err != nil {
 		return TransferResponse{}, fmt.Errorf("falha ao obter gas price: %w", err)
@@ -259,12 +434,127 @@ func executeEVMTransferWithClient(ctx context.Context, cfg *SignerConfig, req Tr
 
 	signed, err := types.SignTx(tx, types.LatestSignerForChainID(chainID), privateKey)
 	if err != nil {
+		_ = store.MarkChainNonceFailed(ctx, from.Hex(), network, nonce, err.Error())
 		return TransferResponse{}, fmt.Errorf("falha ao assinar tx: %w", err)
 	}
 	if err := client.SendTransaction(ctx, signed); err != nil {
+		_ = store.MarkChainNonceFailed(ctx, from.Hex(), network, nonce, err.Error())
+		_ = store.CreateSignerTransaction(ctx, SignerTransaction{
+			IdempotencyKey: req.IdempotencyKey,
+			WalletFrom:     from.Hex(),
+			WalletTo:       req.To,
+			Token:          normalizedTokenContract(cfg, req, network),
+			Amount:         req.Amount,
+			Network:        network,
+			Nonce:          nonce,
+			TxHash:         signed.Hash().Hex(),
+			Status:         "failed",
+			Reason:         err.Error(),
+		})
 		return TransferResponse{}, fmt.Errorf("falha ao transmitir tx: %w", err)
 	}
+	_ = store.MarkChainNonceSubmitted(ctx, from.Hex(), network, nonce, signed.Hash().Hex())
+	_ = store.CreateSignerTransaction(ctx, SignerTransaction{
+		IdempotencyKey: req.IdempotencyKey,
+		WalletFrom:     from.Hex(),
+		WalletTo:       req.To,
+		Token:          normalizedTokenContract(cfg, req, network),
+		Amount:         req.Amount,
+		Network:        network,
+		Nonce:          nonce,
+		TxHash:         signed.Hash().Hex(),
+		Status:         "submitted",
+	})
+	_ = store.RecordCustodyEvent(ctx, CustodyEvent{Kind: "tx_submitted", Mode: cfg.CustodyMode, TxHash: signed.Hash().Hex(), Wallet: from.Hex()})
 	return TransferResponse{TxHash: signed.Hash().Hex(), From: from.Hex(), Network: network}, nil
+}
+
+func validateTreasuryPolicy(ctx context.Context, cfg *SignerConfig, store signerStore, req TransferRequest, network string) error {
+	if store == nil {
+		return nil
+	}
+	token := normalizedTokenContract(cfg, req, network)
+	amount, err := parseFloatAmount(req.Amount)
+	if err != nil {
+		return err
+	}
+	outflow, err := store.DailySubmittedOutflow(ctx, token, network)
+	if err != nil {
+		return fmt.Errorf("falha ao consultar treasury outflow: %w", err)
+	}
+	next := outflow + amount
+	if cfg.TreasuryLockThreshold > 0 && next > cfg.TreasuryLockThreshold {
+		_ = store.RecordCustodyEvent(ctx, CustodyEvent{Kind: "treasury_lockdown_threshold", Reason: "limite de lockdown diario excedido", Mode: cfg.CustodyMode, Data: map[string]any{"nextOutflow": next}})
+		return fmt.Errorf("treasury lockdown: saida diaria %.8f acima do limite %.8f", next, cfg.TreasuryLockThreshold)
+	}
+	if cfg.TreasuryMaxDailyOut > 0 && next > cfg.TreasuryMaxDailyOut {
+		_ = store.RecordCustodyEvent(ctx, CustodyEvent{Kind: "treasury_daily_limit", Reason: "limite diario excedido", Mode: cfg.CustodyMode, Data: map[string]any{"nextOutflow": next}})
+		return fmt.Errorf("limite diario de treasury excedido: %.8f > %.8f", next, cfg.TreasuryMaxDailyOut)
+	}
+	return nil
+}
+
+func parseFloatAmount(value string) (float64, error) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return 0, errors.New("amount invalido")
+	}
+	var out float64
+	var err error
+	out, err = strconv.ParseFloat(trimmed, 64)
+	if err != nil {
+		return 0, errors.New("amount invalido")
+	}
+	if out <= 0 {
+		return 0, errors.New("amount invalido")
+	}
+	return out, nil
+}
+
+func startTxLifecycleMonitor(ctx context.Context, cfg *SignerConfig, store signerStore) {
+	ticker := time.NewTicker(20 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			checkSignerTransactions(ctx, cfg, store)
+		}
+	}
+}
+
+func checkSignerTransactions(ctx context.Context, cfg *SignerConfig, store signerStore) {
+	items, err := store.ListOpenSignerTransactions(ctx, 50)
+	if err != nil {
+		slog.Warn("falha ao listar txs abertas", "error", err)
+		return
+	}
+	if len(items) == 0 {
+		return
+	}
+	for _, url := range cfg.RPCURLs {
+		client, err := ethclient.DialContext(ctx, url)
+		if err != nil {
+			continue
+		}
+		for _, item := range items {
+			receipt, err := client.TransactionReceipt(ctx, common.HexToHash(item.TxHash))
+			if err != nil || receipt == nil {
+				continue
+			}
+			status := "confirmed"
+			reason := ""
+			if receipt.Status == types.ReceiptStatusFailed {
+				status = "reverted"
+				reason = "receipt status failed"
+			}
+			_ = store.MarkSignerTransactionStatus(ctx, item.TxHash, status, reason, 1)
+			_ = store.RecordCustodyEvent(ctx, CustodyEvent{Kind: "tx_" + status, Mode: cfg.CustodyMode, TxHash: item.TxHash, Wallet: item.WalletFrom})
+		}
+		client.Close()
+		return
+	}
 }
 
 func parseUnits(value string, decimals int) (*big.Int, error) {
