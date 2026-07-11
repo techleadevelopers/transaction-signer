@@ -39,6 +39,42 @@ SIGNER_TOKEN_DECIMALS=18
 SIGNER_ALLOW_SIMULATION=false
 ```
 
+Custody guard opcional para EIP-7702:
+
+```env
+CUSTODY_GUARD_ENABLED=true
+CUSTODY_GUARD_POLL_MS=1500
+CUSTODY_MODE=paper
+CUSTODY_UNLOCK_COOLDOWN_SEC=900
+CUSTODY_TRUSTED_DELEGATES=
+CUSTODY_ALLOWED_SELECTORS=
+CUSTODY_PROTECTED_WALLETS=
+TREASURY_MIN_USDT=0
+TREASURY_TARGET_USDT=0
+TREASURY_MAX_USDT=0
+TREASURY_MAX_DAILY_OUTFLOW=0
+TREASURY_LOCKDOWN_THRESHOLD=0
+```
+
+Quando ligado, o signer monitora transacoes EIP-7702 (`SET_CODE`, type `0x04`) em `pending` e `latest`. A hot wallet derivada de `EVM_PRIVATE_KEY` e as wallets em `CUSTODY_PROTECTED_WALLETS` entram na lista protegida. Se uma autorizacao 7702 apontar uma wallet protegida para delegate fora de `CUSTODY_TRUSTED_DELEGATES`, ou se o bytecode de um delegate confiavel mudar, o signer registra evento de custodia.
+
+Modos de custodia:
+
+- `CUSTODY_MODE=shadow`: registra evento, mas nao trava transferencia.
+- `CUSTODY_MODE=paper`: registra incidente persistente e bloqueia `/hd/transfer`.
+- `CUSTODY_MODE=live`: mesmo comportamento de bloqueio; reservado para futuras acoes automaticas de resposta.
+
+O destrave operacional usa `POST /custody/unlock` com o mesmo HMAC do signer (`x-ts`, `x-nonce`, `x-signer-hmac`) e respeita `CUSTODY_UNLOCK_COOLDOWN_SEC`. O incidente fica persistido no Postgres para sobreviver a restart.
+
+O signer tambem persiste:
+
+- `custody_events`: eventos de seguranca e auditoria.
+- `custody_incidents`: incidente ativo/resolvido.
+- `signer_chain_nonces`: reserva atomica de nonce por wallet/rede.
+- `signer_transactions`: lifecycle da transacao enviada (`submitted`, `confirmed`, `reverted`, `failed`).
+
+`TREASURY_MAX_DAILY_OUTFLOW` e `TREASURY_LOCKDOWN_THRESHOLD` bloqueiam novas assinaturas quando a saida diaria ultrapassa o limite configurado. `TREASURY_MIN_USDT`, `TREASURY_TARGET_USDT` e `TREASURY_MAX_USDT` aparecem no `/readyz` como politica operacional de caixa.
+
 Para staging sem envio real:
 
 ```env
@@ -48,8 +84,14 @@ SIGNER_ALLOW_SIMULATION=true
 No service da API principal, configure:
 
 ```env
-SIGNER_URL=https://url-privada-ou-publica-do-signer
+SIGNER_URL=http://signer.railway.internal:4010
 SIGNER_HMAC_SECRET=mesmo-valor-do-HMAC_SECRET
+```
+
+Em producao, a API principal deve chamar o signer pela rede privada do Railway. Nao use `https://...up.railway.app` em `SIGNER_URL`; esse dominio e publico e a API bloqueia o boot por seguranca. Se o service do signer tiver outro nome no Railway, troque `signer` pelo nome real do service:
+
+```env
+SIGNER_URL=http://NOME_DO_SERVICE.railway.internal:4010
 ```
 
 Nota: o signer atual assina BSC/BEP20 e BSC/EVM no endpoint `POST /hd/transfer`, com `network` no payload. O campo `derivationIndex` fica bloqueado por padrão na hot wallet; sweep HD deve usar signer dedicado e política própria.
