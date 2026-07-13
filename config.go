@@ -43,6 +43,7 @@ type SignerConfig struct {
 	DefaultNetwork        string
 	AllowedNetworks       map[string]bool
 	AllowedTokenContracts map[string]bool
+	AllowedContractCalls  map[string]bool
 	MaxTransferAmount     float64
 	TokenDecimals         int
 
@@ -125,6 +126,7 @@ func LoadSignerConfig() *SignerConfig {
 		DefaultNetwork:        strings.ToUpper(getEnv("SIGNER_NETWORK", "BSC")),
 		AllowedNetworks:       parseSet(getEnv("SIGNER_ALLOWED_NETWORKS", "BSC,EVM")),
 		AllowedTokenContracts: parseSet(getEnv("SIGNER_ALLOWED_TOKEN_CONTRACTS", "")),
+		AllowedContractCalls:  parseSet(getEnv("SIGNER_ALLOWED_CONTRACT_CALL_TARGETS", "0xcA11bde05977b3631167028862bE2a173976CA11")),
 		MaxTransferAmount:     getEnvAsFloat("SIGNER_MAX_TRANSFER_AMOUNT", 10000),
 		TokenDecimals:         getEnvAsInt("SIGNER_TOKEN_DECIMALS", 18),
 
