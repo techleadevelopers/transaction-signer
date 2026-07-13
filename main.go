@@ -34,6 +34,16 @@ type TransferRequest struct {
 	DerivationIndex *int   `json:"derivationIndex,omitempty"`
 }
 
+type ContractCallRequest struct {
+	To              string `json:"to"`
+	Data            string `json:"data"`
+	Network         string `json:"network"`
+	IdempotencyKey  string `json:"idempotencyKey"`
+	Amount          string `json:"amount,omitempty"`
+	TokenContract   string `json:"tokenContract,omitempty"`
+	DerivationIndex *int   `json:"derivationIndex,omitempty"`
+}
+
 type TransferResponse struct {
 	TxHash  string `json:"txHash"`
 	From    string `json:"from"`
@@ -258,6 +268,89 @@ func main() {
 		writeSignerJSON(w, resp)
 	})))
 
+	mux.Handle("/hd/contract-call", middleware.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "metodo nao permitido", http.StatusMethodNotAllowed)
+			return
+		}
+
+		if locked, reason := custodyGuard.Locked(); locked {
+			slog.Error("contract-call bloqueado por custody guard", "reason", reason)
+			http.Error(w, "custody guard lockdown", http.StatusLocked)
+			return
+		}
+
+		reqCtx := security.GetRequestContext(r.Context())
+		if reqCtx == nil {
+			http.Error(w, "contexto nao encontrado", http.StatusInternalServerError)
+			return
+		}
+
+		body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		if err != nil {
+			http.Error(w, "erro ao ler body", http.StatusBadRequest)
+			return
+		}
+
+		accepted, err := store.AcceptNonce(r.Context(), reqCtx.Nonce, cfg.GetNonceTTL())
+		if err != nil {
+			slog.Error("falha ao persistir nonce", "error", err)
+			http.Error(w, "storage indisponivel", http.StatusServiceUnavailable)
+			return
+		}
+		if !accepted {
+			http.Error(w, "nonce ja utilizado", http.StatusUnauthorized)
+			return
+		}
+
+		var req ContractCallRequest
+		if err := json.Unmarshal(body, &req); err != nil {
+			http.Error(w, "JSON invalido", http.StatusBadRequest)
+			return
+		}
+
+		slog.Info("contract-call recebido",
+			"requestId", reqCtx.RequestID,
+			"to", shortValue(req.To),
+			"network", requestedContractNetwork(cfg, req),
+			"dataBytes", len(strings.TrimPrefix(req.Data, "0x"))/2,
+		)
+
+		previous, done, claimed, err := store.ClaimResult(r.Context(), req.IdempotencyKey)
+		if err != nil {
+			slog.Error("falha ao reservar idempotencia", "error", err)
+			http.Error(w, "storage indisponivel", http.StatusServiceUnavailable)
+			return
+		}
+		if done {
+			writeSignerJSON(w, previous)
+			return
+		}
+		if !claimed {
+			http.Error(w, "idempotency key em processamento", http.StatusConflict)
+			return
+		}
+
+		resp, err := executeContractCall(r.Context(), cfg, store, req)
+		if err != nil {
+			_ = store.ReleaseClaim(r.Context(), req.IdempotencyKey)
+			slog.Error("falha ao executar contract-call",
+				"error", err,
+				"requestId", reqCtx.RequestID,
+				"network", requestedContractNetwork(cfg, req),
+				"to", shortValue(req.To),
+			)
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		if err := store.SaveResult(r.Context(), req.IdempotencyKey, resp); err != nil {
+			slog.Error("falha ao salvar idempotencia", "error", err)
+			http.Error(w, "storage indisponivel", http.StatusServiceUnavailable)
+			return
+		}
+		writeSignerJSON(w, resp)
+	})))
+
 	server := &http.Server{
 		Addr:         ":" + cfg.Port,
 		Handler:      mux,
@@ -339,6 +432,25 @@ func executeTransfer(ctx context.Context, cfg *SignerConfig, store signerStore, 
 	switch network {
 	case "BSC", "EVM":
 		return executeEVMTransfer(ctx, cfg, store, req, network)
+	default:
+		return TransferResponse{}, fmt.Errorf("rede nao suportada: %s", network)
+	}
+}
+
+func executeContractCall(ctx context.Context, cfg *SignerConfig, store signerStore, req ContractCallRequest) (TransferResponse, error) {
+	network := requestedContractNetwork(cfg, req)
+	if err := validateContractCallPolicy(cfg, req, network); err != nil {
+		return TransferResponse{}, err
+	}
+	if err := validateContractCallTreasuryPolicy(ctx, cfg, store, req, network); err != nil {
+		return TransferResponse{}, err
+	}
+	if req.DerivationIndex != nil {
+		return TransferResponse{}, errors.New("derivacao HD ainda nao habilitada para assinatura de hot wallet")
+	}
+	switch network {
+	case "BSC", "EVM":
+		return executeEVMContractCall(ctx, cfg, store, req, network)
 	default:
 		return TransferResponse{}, fmt.Errorf("rede nao suportada: %s", network)
 	}
@@ -469,6 +581,113 @@ func executeEVMTransferWithClient(ctx context.Context, cfg *SignerConfig, store 
 	return TransferResponse{TxHash: signed.Hash().Hex(), From: from.Hex(), Network: network}, nil
 }
 
+func executeEVMContractCall(ctx context.Context, cfg *SignerConfig, store signerStore, req ContractCallRequest, network string) (TransferResponse, error) {
+	privateKey, err := crypto.HexToECDSA(strings.TrimPrefix(cfg.EVMPrivateKey, "0x"))
+	if err != nil {
+		return TransferResponse{}, fmt.Errorf("EVM_PRIVATE_KEY invalida: %w", err)
+	}
+	from := crypto.PubkeyToAddress(privateKey.PublicKey)
+	if cfg.AllowSimulation {
+		hash := crypto.Keccak256Hash([]byte(req.IdempotencyKey + req.To + req.Data)).Hex()
+		return TransferResponse{TxHash: hash, From: from.Hex(), Network: network}, nil
+	}
+	fleet := cfg.RPCFleet
+	if fleet == nil {
+		fleet = newRPCFleet(cfg.RPCURLs)
+	}
+	var lastErr error
+	for _, handle := range fleet.sendCandidates(len(cfg.RPCURLs)) {
+		start := time.Now()
+		client, err := ethclient.DialContext(ctx, handle.url)
+		if err != nil {
+			fleet.recordFailure(handle.id, classifyRPCFailure(err))
+			lastErr = fmt.Errorf("%s indisponivel: %w", handle.name, err)
+			continue
+		}
+		resp, err := executeEVMContractCallWithClient(ctx, cfg, store, req, network, client, privateKey, from)
+		client.Close()
+		if err != nil {
+			fleet.recordFailure(handle.id, classifyRPCFailure(err))
+			lastErr = fmt.Errorf("%s falhou: %w", handle.name, err)
+			continue
+		}
+		fleet.recordSuccess(handle.id, time.Since(start))
+		return resp, nil
+	}
+	if lastErr == nil {
+		lastErr = errors.New("nenhum RPC BSC disponivel")
+	}
+	return TransferResponse{}, lastErr
+}
+
+func executeEVMContractCallWithClient(ctx context.Context, cfg *SignerConfig, store signerStore, req ContractCallRequest, network string, client *ethclient.Client, privateKey *ecdsa.PrivateKey, from common.Address) (TransferResponse, error) {
+	chainID, err := client.ChainID(ctx)
+	if err != nil {
+		return TransferResponse{}, fmt.Errorf("falha ao obter chain id: %w", err)
+	}
+	if network == "BSC" && chainID.Cmp(big.NewInt(56)) != 0 {
+		return TransferResponse{}, fmt.Errorf("chain id inesperado para BSC: %s", chainID.String())
+	}
+	chainPending, err := client.PendingNonceAt(ctx, from)
+	if err != nil {
+		return TransferResponse{}, fmt.Errorf("falha ao obter nonce: %w", err)
+	}
+	nonce, err := store.ReserveChainNonce(ctx, from.Hex(), network, chainPending)
+	if err != nil {
+		return TransferResponse{}, fmt.Errorf("falha ao reservar nonce: %w", err)
+	}
+	_ = store.RecordCustodyEvent(ctx, CustodyEvent{Kind: "nonce_reserved", Mode: cfg.CustodyMode, Wallet: from.Hex(), Data: map[string]any{"nonce": nonce, "network": network, "type": "contract_call"}})
+	gasPrice, err := client.SuggestGasPrice(ctx)
+	if err != nil {
+		return TransferResponse{}, fmt.Errorf("falha ao obter gas price: %w", err)
+	}
+	data, err := decodeHexData(req.Data)
+	if err != nil {
+		return TransferResponse{}, err
+	}
+	to := common.HexToAddress(req.To)
+	gasLimit, err := client.EstimateGas(ctx, ethereum.CallMsg{From: from, To: &to, Data: data})
+	if err != nil || gasLimit == 0 {
+		gasLimit = 350000
+	}
+	tx := types.NewTransaction(nonce, to, big.NewInt(0), gasLimit, gasPrice, data)
+	signed, err := types.SignTx(tx, types.LatestSignerForChainID(chainID), privateKey)
+	if err != nil {
+		_ = store.MarkChainNonceFailed(ctx, from.Hex(), network, nonce, err.Error())
+		return TransferResponse{}, fmt.Errorf("falha ao assinar tx: %w", err)
+	}
+	if err := client.SendTransaction(ctx, signed); err != nil {
+		_ = store.MarkChainNonceFailed(ctx, from.Hex(), network, nonce, err.Error())
+		_ = store.CreateSignerTransaction(ctx, SignerTransaction{
+			IdempotencyKey: req.IdempotencyKey,
+			WalletFrom:     from.Hex(),
+			WalletTo:       req.To,
+			Token:          strings.TrimSpace(req.TokenContract),
+			Amount:         firstNonEmptySigner(req.Amount, "0"),
+			Network:        network,
+			Nonce:          nonce,
+			TxHash:         signed.Hash().Hex(),
+			Status:         "failed",
+			Reason:         err.Error(),
+		})
+		return TransferResponse{}, fmt.Errorf("falha ao transmitir tx: %w", err)
+	}
+	_ = store.MarkChainNonceSubmitted(ctx, from.Hex(), network, nonce, signed.Hash().Hex())
+	_ = store.CreateSignerTransaction(ctx, SignerTransaction{
+		IdempotencyKey: req.IdempotencyKey,
+		WalletFrom:     from.Hex(),
+		WalletTo:       req.To,
+		Token:          strings.TrimSpace(req.TokenContract),
+		Amount:         firstNonEmptySigner(req.Amount, "0"),
+		Network:        network,
+		Nonce:          nonce,
+		TxHash:         signed.Hash().Hex(),
+		Status:         "submitted",
+	})
+	_ = store.RecordCustodyEvent(ctx, CustodyEvent{Kind: "tx_submitted", Mode: cfg.CustodyMode, TxHash: signed.Hash().Hex(), Wallet: from.Hex(), Data: map[string]any{"type": "contract_call"}})
+	return TransferResponse{TxHash: signed.Hash().Hex(), From: from.Hex(), Network: network}, nil
+}
+
 func validateTreasuryPolicy(ctx context.Context, cfg *SignerConfig, store signerStore, req TransferRequest, network string) error {
 	if store == nil {
 		return nil
@@ -489,6 +708,31 @@ func validateTreasuryPolicy(ctx context.Context, cfg *SignerConfig, store signer
 	}
 	if cfg.TreasuryMaxDailyOut > 0 && next > cfg.TreasuryMaxDailyOut {
 		_ = store.RecordCustodyEvent(ctx, CustodyEvent{Kind: "treasury_daily_limit", Reason: "limite diario excedido", Mode: cfg.CustodyMode, Data: map[string]any{"nextOutflow": next}})
+		return fmt.Errorf("limite diario de treasury excedido: %.8f > %.8f", next, cfg.TreasuryMaxDailyOut)
+	}
+	return nil
+}
+
+func validateContractCallTreasuryPolicy(ctx context.Context, cfg *SignerConfig, store signerStore, req ContractCallRequest, network string) error {
+	if store == nil || strings.TrimSpace(req.Amount) == "" {
+		return nil
+	}
+	amount, err := parseFloatAmount(req.Amount)
+	if err != nil {
+		return err
+	}
+	token := strings.TrimSpace(req.TokenContract)
+	outflow, err := store.DailySubmittedOutflow(ctx, token, network)
+	if err != nil {
+		return fmt.Errorf("falha ao consultar treasury outflow: %w", err)
+	}
+	next := outflow + amount
+	if cfg.TreasuryLockThreshold > 0 && next > cfg.TreasuryLockThreshold {
+		_ = store.RecordCustodyEvent(ctx, CustodyEvent{Kind: "treasury_lockdown_threshold", Reason: "limite de lockdown diario excedido", Mode: cfg.CustodyMode, Data: map[string]any{"nextOutflow": next, "type": "contract_call"}})
+		return fmt.Errorf("treasury lockdown: saida diaria %.8f acima do limite %.8f", next, cfg.TreasuryLockThreshold)
+	}
+	if cfg.TreasuryMaxDailyOut > 0 && next > cfg.TreasuryMaxDailyOut {
+		_ = store.RecordCustodyEvent(ctx, CustodyEvent{Kind: "treasury_daily_limit", Reason: "limite diario excedido", Mode: cfg.CustodyMode, Data: map[string]any{"nextOutflow": next, "type": "contract_call"}})
 		return fmt.Errorf("limite diario de treasury excedido: %.8f > %.8f", next, cfg.TreasuryMaxDailyOut)
 	}
 	return nil
@@ -598,6 +842,31 @@ func erc20TransferData(to common.Address, amount *big.Int) []byte {
 	amountBytes := amount.Bytes()
 	copy(data[68-len(amountBytes):], amountBytes)
 	return data
+}
+
+func decodeHexData(value string) ([]byte, error) {
+	trimmed := strings.TrimPrefix(strings.TrimSpace(value), "0x")
+	if trimmed == "" || len(trimmed)%2 != 0 {
+		return nil, errors.New("data hex invalido")
+	}
+	data, err := hex.DecodeString(trimmed)
+	if err != nil {
+		return nil, errors.New("data hex invalido")
+	}
+	return data, nil
+}
+
+func requestedContractNetwork(cfg *SignerConfig, req ContractCallRequest) string {
+	return requestedNetwork(cfg, TransferRequest{Network: req.Network})
+}
+
+func firstNonEmptySigner(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func writeSignerJSON(w http.ResponseWriter, payload any) {
