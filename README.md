@@ -88,6 +88,27 @@ SIGNER_URL=http://signer.railway.internal:4010
 SIGNER_HMAC_SECRET=mesmo-valor-do-HMAC_SECRET
 ```
 
+## RelaÃ§Ã£o com Gas Station / Paymaster
+
+O Paymaster/Gas Station roda no core (`internal/paymaster`) e orquestra quote, relay, idempotencia, retry, batching e DLQ. Ele **nao guarda chave privada**.
+
+Responsabilidades separadas:
+
+| Camada | Responsabilidade |
+| --- | --- |
+| `internal/paymaster` | quote de gas, `sig_hash`, relay request, batching, retry/DLQ e persistencia em `gas_relay_requests` |
+| `internal/rpc` | pool RPC e health checks usados por oracle/estimator/AutoSweeper |
+| `signer` | assinatura isolada, HMAC interno, nonce atomico, custody guard e broadcast |
+| `auto_sweeper_runs` | auditoria de sweeps/idempotencia operacional |
+
+O fluxo de relay deve sempre passar por API core -> signer privado. Nunca exponha o signer diretamente como endpoint publico de Gas Station.
+
+Teste de carga recomendado no core:
+
+```bash
+k6 run tests/paymaster_stress.js -e BASE_URL=https://api.chainfx.store -e API_KEY_LIVE=sk_live_... -e API_KEY_TEST=sk_test_...
+```
+
 Em producao, a API principal deve chamar o signer pela rede privada do Railway. Nao use `https://...up.railway.app` em `SIGNER_URL`; esse dominio e publico e a API bloqueia o boot por seguranca. Se o service do signer tiver outro nome no Railway, troque `signer` pelo nome real do service:
 
 ```env
