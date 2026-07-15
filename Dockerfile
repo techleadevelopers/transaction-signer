@@ -25,7 +25,7 @@ WORKDIR /app
 
 COPY --from=builder /out/signer /app/signer
 
-ENV PORT=4010
+ENV PORT_SIGNER=4010
 EXPOSE 4010
 
 CMD ["/app/signer"]
