@@ -88,7 +88,7 @@ SIGNER_URL=http://signer.railway.internal:4010
 SIGNER_HMAC_SECRET=mesmo-valor-do-HMAC_SECRET
 ```
 
-## RelaÃ§Ã£o com Gas Station / Paymaster
+## Relação com Gas Station / Paymaster
 
 O Paymaster/Gas Station roda no core (`internal/paymaster`) e orquestra quote, relay, idempotencia, retry, batching e DLQ. Ele **nao guarda chave privada**.
 
@@ -117,7 +117,7 @@ SIGNER_URL=http://NOME_DO_SERVICE.railway.internal:4010
 
 Nota: o signer atual assina BSC/BEP20 e BSC/EVM no endpoint `POST /hd/transfer`, com `network` no payload. O campo `derivationIndex` fica bloqueado por padrão na hot wallet; sweep HD deve usar signer dedicado e política própria.
 
-# Swappy BSC/BSC Core Signer 🛡️
+# ChainFX BSC/BSC Core Signer 🛡️
 ### Motor de Assinatura Criptográfica de Alta Performance e Isolamento de Chaves em Go
 
 O `signer` é um microsserviço isolado de infraestrutura crítica (isolado do Core público da API) responsável unicamente por gerenciar chaves privadas, derivar carteiras e assinar transações on-chain (EVM/BSC) para liquidação de ordens de compra (*Buy/Send*) e varreduras automáticas de depósitos (*Sweeping*).
