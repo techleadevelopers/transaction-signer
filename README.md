@@ -21,7 +21,7 @@ GET /readyz
 Variaveis obrigatorias:
 
 ```env
-PORT=4010
+PORT_SIGNER=4010
 APP_ENV=production
 HMAC_SECRET=mesmo-valor-usado-no-core-como-SIGNER_HMAC_SECRET
 SIGNER_DATABASE_URL=postgres://...
@@ -114,6 +114,8 @@ Em producao, a API principal deve chamar o signer pela rede privada do Railway. 
 ```env
 SIGNER_URL=http://NOME_DO_SERVICE.railway.internal:4010
 ```
+
+Use `PORT_SIGNER=4010` no service do signer para nao confundir com `PORT=8080` da API/gateway. O signer ainda aceita `PORT` como fallback por compatibilidade.
 
 Nota: o signer atual assina BSC/BEP20 e BSC/EVM no endpoint `POST /hd/transfer`, com `network` no payload. O campo `derivationIndex` fica bloqueado por padrão na hot wallet; sweep HD deve usar signer dedicado e política própria.
 
