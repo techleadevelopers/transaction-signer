@@ -39,6 +39,7 @@ type SignerConfig struct {
 	AppEnv                string
 	Port                  string
 	DatabaseURL           string
+	RedisURL              string
 	AllowSimulation       bool
 	DefaultNetwork        string
 	AllowedNetworks       map[string]bool
@@ -107,6 +108,9 @@ func (c *SignerConfig) ValidateProduction() error {
 	if c.Security.RequireNonce && c.Security.NonceTTLSeconds <= 0 {
 		return fmt.Errorf("NONCE_TTL_SECONDS deve ser > 0 quando RequireNonce=true")
 	}
+	if c.Security.RequireNonce && strings.EqualFold(strings.TrimSpace(c.Security.NonceStoreType), "redis") && strings.TrimSpace(c.RedisURL) == "" {
+		return fmt.Errorf("REDIS_URL obrigatorio quando NONCE_STORE_TYPE=redis")
+	}
 
 	return nil
 }
@@ -122,6 +126,7 @@ func LoadSignerConfig() *SignerConfig {
 		AppEnv:                strings.ToLower(getEnv("APP_ENV", getEnv("ENV", "development"))),
 		Port:                  getEnv("PORT", "4010"),
 		DatabaseURL:           getEnv("SIGNER_DATABASE_URL", getEnv("DATABASE_URL", "")),
+		RedisURL:              getEnv("REDIS_URL", ""),
 		AllowSimulation:       getEnvAsBool("SIGNER_ALLOW_SIMULATION", false),
 		DefaultNetwork:        strings.ToUpper(getEnv("SIGNER_NETWORK", "BSC")),
 		AllowedNetworks:       parseSet(getEnv("SIGNER_ALLOWED_NETWORKS", "BSC,EVM")),
@@ -145,8 +150,8 @@ func LoadSignerConfig() *SignerConfig {
 			HMACOldSecret:  getEnv("HMAC_OLD_SECRET", ""), // Para rotação
 
 			// Nonce
-			NonceTTLSeconds: getEnvAsInt64("NONCE_TTL_SECONDS", 300), // 5 minutos
-			NonceStoreType:  getEnv("NONCE_STORE_TYPE", "memory"),    // "memory" ou "redis"
+			NonceTTLSeconds: getEnvAsInt64("NONCE_TTL_SECONDS", 300),                                  // 5 minutos
+			NonceStoreType:  strings.ToLower(strings.TrimSpace(getEnv("NONCE_STORE_TYPE", "memory"))), // "memory" ou "redis"
 
 			// Rate Limit
 			RateLimitPerMin: getEnvAsInt("RATE_LIMIT_PER_MIN", 100),
