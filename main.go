@@ -58,7 +58,12 @@ func main() {
 	}
 
 	// ===== NOVO: Configurar Security =====
-	_, middleware := setupSecurity(cfg)
+	_, middleware, closeSecurity, err := setupSecurity(cfg)
+	if err != nil {
+		slog.Error("falha ao configurar seguranca do signer", "error", err)
+		os.Exit(1)
+	}
+	defer closeSecurity()
 
 	// Validações existentes
 	if cfg.Security.HMACSecret == "" {
@@ -107,6 +112,7 @@ func main() {
 			"ok":           !locked,
 			"service":      "signer",
 			"network":      cfg.DefaultNetwork,
+			"nonceStore":   cfg.Security.NonceStoreType,
 			"custodyGuard": cfg.CustodyGuardEnabled,
 			"custodyMode":  cfg.CustodyMode,
 			"lockdown":     locked,
@@ -374,16 +380,26 @@ func main() {
 }
 
 // ===== NOVA FUNÇÃO: setupSecurity =====
-func setupSecurity(cfg *SignerConfig) (*security.RequestValidator, *security.Middleware) {
+func setupSecurity(cfg *SignerConfig) (*security.RequestValidator, *security.Middleware, func(), error) {
 	// Configura Nonce Store
 	var nonceStore security.NonceStore
+	closeSecurity := func() {}
 	switch cfg.Security.NonceStoreType {
 	case "redis":
-		// Se tiver Redis configurado
-		// nonceStore = security.NewRedisNonceStore(redisClient)
-		// Por enquanto, fallback para memory
-		slog.Warn("Redis nonce store não implementado, usando memory", "storeType", cfg.Security.NonceStoreType)
-		nonceStore = security.NewInMemoryNonceStore()
+		if strings.TrimSpace(cfg.RedisURL) == "" {
+			return nil, nil, nil, fmt.Errorf("REDIS_URL obrigatorio quando NONCE_STORE_TYPE=redis")
+		}
+		redisStore, err := security.NewRedisNonceStore(cfg.RedisURL)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("redis nonce store indisponivel: %w", err)
+		}
+		nonceStore = redisStore
+		closeSecurity = func() {
+			if err := redisStore.Close(); err != nil {
+				slog.Warn("falha ao fechar redis nonce store", "error", err)
+			}
+		}
+		slog.Info("Redis nonce store configurado", "storeType", cfg.Security.NonceStoreType)
 	default:
 		nonceStore = security.NewInMemoryNonceStore()
 	}
@@ -413,7 +429,7 @@ func setupSecurity(cfg *SignerConfig) (*security.RequestValidator, *security.Mid
 		AllowedMethods: []string{"POST", "GET"},
 	})
 
-	return validator, middleware
+	return validator, middleware, closeSecurity, nil
 }
 
 // ===== Funções existentes (mantidas) =====
