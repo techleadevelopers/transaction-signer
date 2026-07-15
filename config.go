@@ -124,7 +124,7 @@ func LoadSignerConfig() *SignerConfig {
 	return &SignerConfig{
 		// ===== Gerais =====
 		AppEnv:                strings.ToLower(getEnv("APP_ENV", getEnv("ENV", "development"))),
-		Port:                  getEnv("PORT", "4010"),
+		Port:                  getEnv("PORT_SIGNER", getEnv("PORT", "4010")),
 		DatabaseURL:           getEnv("SIGNER_DATABASE_URL", getEnv("DATABASE_URL", "")),
 		RedisURL:              getEnv("REDIS_URL", ""),
 		AllowSimulation:       getEnvAsBool("SIGNER_ALLOW_SIMULATION", false),
