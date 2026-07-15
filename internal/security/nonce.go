@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 )
 
 // NonceStore interface para armazenamento de nonces
@@ -136,37 +138,78 @@ func (s *InMemoryNonceStore) Cleanup(ctx context.Context) error {
 
 // RedisNonceStore implementação com Redis
 type RedisNonceStore struct {
-	client interface{} // Substituir pelo cliente Redis real
+	client *redis.Client
+	prefix string
 }
 
 // NewRedisNonceStore cria um novo store Redis
-func NewRedisNonceStore(client interface{}) *RedisNonceStore {
-	return &RedisNonceStore{client: client}
+func NewRedisNonceStore(redisURL string) (*RedisNonceStore, error) {
+	opt, err := redis.ParseURL(redisURL)
+	if err != nil {
+		return nil, err
+	}
+	opt.PoolSize = 16
+	opt.MinIdleConns = 2
+	opt.MaxRetries = 2
+	opt.DialTimeout = 2 * time.Second
+	opt.ReadTimeout = 700 * time.Millisecond
+	opt.WriteTimeout = 700 * time.Millisecond
+	opt.PoolTimeout = 800 * time.Millisecond
+
+	client := redis.NewClient(opt)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := client.Ping(ctx).Err(); err != nil {
+		_ = client.Close()
+		return nil, err
+	}
+	return &RedisNonceStore{client: client, prefix: "signer:nonce:"}, nil
 }
 
 // Store armazena nonce no Redis com TTL
 func (s *RedisNonceStore) Store(ctx context.Context, nonce string, ttl time.Duration) error {
-	// Exemplo com go-redis:
-	// return s.client.Set(ctx, "nonce:"+nonce, "1", ttl).Err()
+	if s == nil || s.client == nil {
+		return fmt.Errorf("redis nonce store nao inicializado")
+	}
+	ok, err := s.client.SetNX(ctx, s.key(nonce), "1", ttl).Result()
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("nonce ja existe")
+	}
 	return nil
 }
 
 // Exists verifica se nonce existe no Redis
 func (s *RedisNonceStore) Exists(ctx context.Context, nonce string) (bool, error) {
-	// Exemplo com go-redis:
-	// val, err := s.client.Exists(ctx, "nonce:"+nonce).Result()
-	// return val > 0, err
-	return false, nil
+	if s == nil || s.client == nil {
+		return false, fmt.Errorf("redis nonce store nao inicializado")
+	}
+	val, err := s.client.Exists(ctx, s.key(nonce)).Result()
+	return val > 0, err
 }
 
 // Delete remove nonce do Redis
 func (s *RedisNonceStore) Delete(ctx context.Context, nonce string) error {
-	// Exemplo com go-redis:
-	// return s.client.Del(ctx, "nonce:"+nonce).Err()
-	return nil
+	if s == nil || s.client == nil {
+		return nil
+	}
+	return s.client.Del(ctx, s.key(nonce)).Err()
 }
 
 // Cleanup não necessário no Redis (TTL automático)
 func (s *RedisNonceStore) Cleanup(ctx context.Context) error {
 	return nil
+}
+
+func (s *RedisNonceStore) Close() error {
+	if s == nil || s.client == nil {
+		return nil
+	}
+	return s.client.Close()
+}
+
+func (s *RedisNonceStore) key(nonce string) string {
+	return s.prefix + nonce
 }
