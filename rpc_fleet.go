@@ -264,7 +264,11 @@ func classifyRPCFailure(err error) rpcFailureKind {
 	}
 	lower := strings.ToLower(err.Error())
 	switch {
-	case strings.Contains(lower, "monthly capacity limit exceeded"),
+	case strings.Contains(lower, "402"),
+		strings.Contains(lower, "payment required"),
+		strings.Contains(lower, "out of cu"),
+		strings.Contains(lower, "out of compute"),
+		strings.Contains(lower, "monthly capacity limit exceeded"),
 		strings.Contains(lower, "capacity limit exceeded"),
 		strings.Contains(lower, "quota exceeded"),
 		strings.Contains(lower, "billing"):
