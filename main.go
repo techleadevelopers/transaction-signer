@@ -17,10 +17,9 @@ import (
 	"time"
 
 	"payment-gateway/internal/security"
-	"payment-gateway/internal/transactions"
 
-	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum"
+	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -66,6 +65,8 @@ type SettlementExecuteRequest struct {
 	ExpiresAt          string `json:"expiresAt"`
 	IdempotencyKey     string `json:"idempotencyKey"`
 }
+
+const settlementPolicyVersion = "settlement-policy-v1.0.0"
 
 type TransferResponse struct {
 	TxHash  string `json:"txHash"`
@@ -215,6 +216,10 @@ func main() {
 			http.Error(w, "metodo nao permitido", http.StatusMethodNotAllowed)
 			return
 		}
+		if cfg.IsProduction() {
+			http.Error(w, "DIRECT_TRANSFER_DISABLED", http.StatusForbidden)
+			return
+		}
 
 		if locked, reason := custodyGuard.Locked(); locked {
 			slog.Error("transferencia bloqueada por custody guard", "reason", reason)
@@ -285,6 +290,92 @@ func main() {
 				"requestId", reqCtx.RequestID,
 				"network", requestedNetwork(cfg, req),
 				"to", shortValue(req.To),
+			)
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		if err := store.SaveResult(r.Context(), req.IdempotencyKey, resp); err != nil {
+			slog.Error("falha ao salvar idempotencia", "error", err)
+			http.Error(w, "storage indisponivel", http.StatusServiceUnavailable)
+			return
+		}
+		writeSignerJSON(w, resp)
+	})))
+
+	mux.Handle("/settlements/execute", middleware.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "metodo nao permitido", http.StatusMethodNotAllowed)
+			return
+		}
+
+		if locked, reason := custodyGuard.Locked(); locked {
+			slog.Error("settlement bloqueado por custody guard", "reason", reason)
+			http.Error(w, "custody guard lockdown", http.StatusLocked)
+			return
+		}
+
+		reqCtx := security.GetRequestContext(r.Context())
+		if reqCtx == nil {
+			http.Error(w, "contexto nao encontrado", http.StatusInternalServerError)
+			return
+		}
+
+		body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		if err != nil {
+			http.Error(w, "erro ao ler body", http.StatusBadRequest)
+			return
+		}
+
+		accepted, err := store.AcceptNonce(r.Context(), reqCtx.Nonce, cfg.GetNonceTTL())
+		if err != nil {
+			slog.Error("falha ao persistir nonce", "error", err)
+			http.Error(w, "storage indisponivel", http.StatusServiceUnavailable)
+			return
+		}
+		if !accepted {
+			http.Error(w, "nonce ja utilizado", http.StatusUnauthorized)
+			return
+		}
+
+		var req SettlementExecuteRequest
+		if err := json.Unmarshal(body, &req); err != nil {
+			http.Error(w, "JSON invalido", http.StatusBadRequest)
+			return
+		}
+		if strings.TrimSpace(req.IdempotencyKey) == "" {
+			req.IdempotencyKey = strings.TrimSpace(req.OperationID)
+		}
+
+		slog.Info("settlement recebido",
+			"requestId", reqCtx.RequestID,
+			"operationId", shortValue(req.OperationID),
+			"orderId", req.OrderID,
+			"network", req.Network,
+			"recipient", shortValue(req.Recipient),
+		)
+
+		previous, done, claimed, err := store.ClaimResult(r.Context(), req.IdempotencyKey)
+		if err != nil {
+			slog.Error("falha ao reservar idempotencia", "error", err)
+			http.Error(w, "storage indisponivel", http.StatusServiceUnavailable)
+			return
+		}
+		if done {
+			writeSignerJSON(w, previous)
+			return
+		}
+		if !claimed {
+			http.Error(w, "idempotency key em processamento", http.StatusConflict)
+			return
+		}
+
+		resp, err := executeSettlement(r.Context(), cfg, store, req)
+		if err != nil {
+			_ = store.ReleaseClaim(r.Context(), req.IdempotencyKey)
+			slog.Error("falha ao executar settlement",
+				"error", err,
+				"requestId", reqCtx.RequestID,
+				"operationId", shortValue(req.OperationID),
 			)
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
