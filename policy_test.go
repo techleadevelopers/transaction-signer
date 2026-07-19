@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"math/big"
 	"testing"
 	"time"
 )
@@ -109,5 +110,71 @@ func TestSignerValidateProductionRequiresTokenAllowlist(t *testing.T) {
 	}
 	if err := cfg.ValidateProduction(); err == nil {
 		t.Fatal("expected missing token allowlist to fail production validation")
+	}
+}
+
+func TestSettlementOperationIDMatchesHardhatVector(t *testing.T) {
+	got, err := settlementOperationID(
+		31337,
+		"0x1111111111111111111111111111111111111111",
+		"settlement-001",
+		"0x2222222222222222222222222222222222222222",
+		"0x3333333333333333333333333333333333333333",
+		big.NewInt(10000000),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const expected = "0xddf2d849f366d3663412542b335fe30a92e2e01b0869ddf5d24f9b68eaf6ad52"
+	if got.Hex() != expected {
+		t.Fatalf("operationId mismatch: got %s want %s", got.Hex(), expected)
+	}
+}
+
+func TestValidateSettlementExecuteRequest(t *testing.T) {
+	vault := "0x1111111111111111111111111111111111111111"
+	token := "0x2222222222222222222222222222222222222222"
+	recipient := "0x3333333333333333333333333333333333333333"
+	amountRaw := big.NewInt(10000000)
+	operationID, err := settlementOperationID(31337, vault, "settlement-001", token, recipient, amountRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := &SignerConfig{
+		DefaultNetwork:        "BSC",
+		AllowedNetworks:       map[string]bool{"BSC": true},
+		AllowedTokenContracts: map[string]bool{"0X2222222222222222222222222222222222222222": true},
+		BSCUSDTContract:       token,
+		BSCTreasuryContract:   vault,
+		BSCChainID:            31337,
+	}
+	req := SettlementExecuteRequest{
+		OperationID:        operationID.Hex(),
+		SettlementIntentID: "settlement-001",
+		OrderID:            "ord-001",
+		Side:               "BUY",
+		Network:            "BSC",
+		ChainID:            31337,
+		Vault:              vault,
+		Token:              token,
+		Recipient:          recipient,
+		AmountRaw:          amountRaw.String(),
+		PolicyVersion:      settlementPolicyVersion,
+		ExpiresAt:          time.Now().Add(5 * time.Minute).UTC().Format(time.RFC3339Nano),
+	}
+	if _, _, err := validateSettlementExecuteRequest(cfg, req); err != nil {
+		t.Fatalf("settlement valido rejeitado: %v", err)
+	}
+
+	bad := req
+	bad.AmountRaw = "10000001"
+	if _, _, err := validateSettlementExecuteRequest(cfg, bad); err == nil {
+		t.Fatal("operationId divergente deveria ser rejeitado")
+	}
+
+	expired := req
+	expired.ExpiresAt = time.Now().Add(-time.Minute).UTC().Format(time.RFC3339Nano)
+	if _, _, err := validateSettlementExecuteRequest(cfg, expired); err == nil {
+		t.Fatal("authorization expirada deveria ser rejeitada")
 	}
 }
