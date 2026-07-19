@@ -113,6 +113,25 @@ func TestSignerValidateProductionRequiresTokenAllowlist(t *testing.T) {
 	}
 }
 
+func TestSignerValidateProductionAllowsDirectWalletWithoutTreasuryContract(t *testing.T) {
+	cfg := &SignerConfig{
+		AppEnv:          "production",
+		DatabaseURL:     "postgres://user:pass@localhost/db",
+		AllowSimulation: false,
+		Security: SecurityConfig{
+			HMACSecret:  "0123456789abcdef0123456789abcdef",
+			RequireHMAC: true,
+		},
+		AllowedNetworks:       map[string]bool{"BSC": true},
+		AllowedTokenContracts: map[string]bool{"0X55D398326F99059FF775485246999027B3197955": true},
+		BSCUSDTContract:       "0x55d398326f99059fF775485246999027B3197955",
+		MaxTransferAmount:     100,
+	}
+	if err := cfg.ValidateProduction(); err != nil {
+		t.Fatalf("production direct wallet config should not require treasury contract: %v", err)
+	}
+}
+
 func TestSettlementOperationIDMatchesHardhatVector(t *testing.T) {
 	got, err := settlementOperationID(
 		31337,
