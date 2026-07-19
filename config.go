@@ -49,13 +49,13 @@ type SignerConfig struct {
 	TokenDecimals         int
 
 	// ===== Blockchain =====
-	EVMPrivateKey   string
-	RPCURL          string
-	RPCURLs         []string
-	RPCFleet        *rpcFleet
-	BSCUSDTContract string
+	EVMPrivateKey       string
+	RPCURL              string
+	RPCURLs             []string
+	RPCFleet            *rpcFleet
+	BSCUSDTContract     string
 	BSCTreasuryContract string
-	BSCChainID      int64
+	BSCChainID          int64
 
 	// ===== Segurança =====
 	Security SecurityConfig
@@ -141,13 +141,13 @@ func LoadSignerConfig() *SignerConfig {
 		TokenDecimals:         getEnvAsInt("SIGNER_TOKEN_DECIMALS", 18),
 
 		// ===== Blockchain =====
-		EVMPrivateKey:   getEnv("EVM_PRIVATE_KEY", ""),
-		RPCURL:          getEnv("RPC_URL", "https://bsc-dataseed.binance.org/"),
-		RPCURLs:         rpcURLs,
-		RPCFleet:        newRPCFleet(rpcURLs),
-	BSCUSDTContract: getEnv("BSC_USDT_CONTRACT", getEnv("BSC_TOKEN_CONTRACT", "")),
-	BSCTreasuryContract: getEnv("BSC_TREASURY_CONTRACT", ""),
-	BSCChainID:      getEnvAsInt64("BSC_CHAIN_ID", 56),
+		EVMPrivateKey:       getEnv("EVM_PRIVATE_KEY", ""),
+		RPCURL:              getEnv("RPC_URL", "https://bsc-dataseed.binance.org/"),
+		RPCURLs:             rpcURLs,
+		RPCFleet:            newRPCFleet(rpcURLs),
+		BSCUSDTContract:     getEnv("BSC_USDT_CONTRACT", getEnv("BSC_TOKEN_CONTRACT", "")),
+		BSCTreasuryContract: getEnv("BSC_TREASURY_CONTRACT", ""),
+		BSCChainID:          getEnvAsInt64("BSC_CHAIN_ID", 56),
 
 		// ===== Segurança =====
 		Security: SecurityConfig{
