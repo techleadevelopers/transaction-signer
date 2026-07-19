@@ -54,6 +54,8 @@ type SignerConfig struct {
 	RPCURLs         []string
 	RPCFleet        *rpcFleet
 	BSCUSDTContract string
+	BSCTreasuryContract string
+	BSCChainID      int64
 
 	// ===== Segurança =====
 	Security SecurityConfig
@@ -95,6 +97,9 @@ func (c *SignerConfig) ValidateProduction() error {
 
 	if len(c.AllowedTokenContracts) == 0 {
 		return fmt.Errorf("SIGNER_ALLOWED_TOKEN_CONTRACTS deve fixar contratos permitidos em producao")
+	}
+	if strings.TrimSpace(c.BSCTreasuryContract) == "" {
+		return fmt.Errorf("BSC_TREASURY_CONTRACT obrigatorio em producao")
 	}
 
 	if len(strings.TrimSpace(c.Security.HMACSecret)) < 32 {
@@ -140,7 +145,9 @@ func LoadSignerConfig() *SignerConfig {
 		RPCURL:          getEnv("RPC_URL", "https://bsc-dataseed.binance.org/"),
 		RPCURLs:         rpcURLs,
 		RPCFleet:        newRPCFleet(rpcURLs),
-		BSCUSDTContract: getEnv("BSC_USDT_CONTRACT", getEnv("BSC_TOKEN_CONTRACT", "")),
+	BSCUSDTContract: getEnv("BSC_USDT_CONTRACT", getEnv("BSC_TOKEN_CONTRACT", "")),
+	BSCTreasuryContract: getEnv("BSC_TREASURY_CONTRACT", ""),
+	BSCChainID:      getEnvAsInt64("BSC_CHAIN_ID", 56),
 
 		// ===== Segurança =====
 		Security: SecurityConfig{
