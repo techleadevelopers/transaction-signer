@@ -155,9 +155,9 @@ func main() {
 			ready["ok"] = false
 			ready["storage"] = err.Error()
 		}
-		if (cfg.DefaultNetwork == "BSC" || cfg.DefaultNetwork == "EVM") && (len(cfg.RPCURLs) == 0 || cfg.BSCUSDTContract == "") {
+		if (cfg.DefaultNetwork == "BSC" || cfg.DefaultNetwork == "EVM") && (len(cfg.RPCURLs) == 0 || cfg.BSCUSDTContract == "" || cfg.BSCTreasuryContract == "") {
 			ready["ok"] = false
-			ready["bsc"] = "BSC_RPC_URLS e BSC_USDT_CONTRACT obrigatorios"
+			ready["bsc"] = "BSC_RPC_URLS, BSC_USDT_CONTRACT e BSC_TREASURY_CONTRACT obrigatorios"
 		}
 		status := http.StatusOK
 		if ready["ok"] == false {
@@ -547,6 +547,213 @@ func setupSecurity(cfg *SignerConfig) (*security.RequestValidator, *security.Mid
 }
 
 // ===== Funções existentes (mantidas) =====
+
+func executeSettlement(ctx context.Context, cfg *SignerConfig, store signerStore, req SettlementExecuteRequest) (TransferResponse, error) {
+	network, amount, err := validateSettlementExecuteRequest(cfg, req)
+	if err != nil {
+		return TransferResponse{}, err
+	}
+	switch network {
+	case "BSC", "EVM":
+		return executeEVMSettlement(ctx, cfg, store, req, network, amount)
+	default:
+		return TransferResponse{}, fmt.Errorf("rede nao suportada: %s", network)
+	}
+}
+
+func validateSettlementExecuteRequest(cfg *SignerConfig, req SettlementExecuteRequest) (string, *big.Int, error) {
+	network := strings.ToUpper(strings.TrimSpace(req.Network))
+	if network == "" {
+		network = cfg.DefaultNetwork
+	}
+	if network == "BINANCE" || network == "BEP20" {
+		network = "BSC"
+	}
+	if !cfg.AllowedNetworks[network] {
+		return "", nil, fmt.Errorf("rede nao permitida: %s", network)
+	}
+	if network != "BSC" && network != "EVM" {
+		return "", nil, fmt.Errorf("rede nao suportada: %s", network)
+	}
+	if req.ChainID == 0 {
+		return "", nil, errors.New("chainId obrigatorio")
+	}
+	if network == "BSC" && cfg.BSCChainID > 0 && req.ChainID != uint64(cfg.BSCChainID) {
+		return "", nil, fmt.Errorf("chainId divergente para BSC: %d", req.ChainID)
+	}
+	if strings.TrimSpace(req.OperationID) == "" {
+		return "", nil, errors.New("operationId obrigatorio")
+	}
+	operationIDHex := strings.TrimPrefix(strings.TrimSpace(req.OperationID), "0x")
+	if len(operationIDHex) != 64 {
+		return "", nil, errors.New("operationId invalido")
+	}
+	if _, err := hex.DecodeString(operationIDHex); err != nil {
+		return "", nil, errors.New("operationId invalido")
+	}
+	if strings.TrimSpace(req.SettlementIntentID) == "" {
+		return "", nil, errors.New("settlementIntentId obrigatorio")
+	}
+	if strings.TrimSpace(req.OrderID) == "" {
+		return "", nil, errors.New("orderId obrigatorio")
+	}
+	if !common.IsHexAddress(req.Vault) {
+		return "", nil, errors.New("vault EVM invalido")
+	}
+	if strings.TrimSpace(cfg.BSCTreasuryContract) == "" {
+		return "", nil, errors.New("BSC_TREASURY_CONTRACT obrigatorio")
+	}
+	if !strings.EqualFold(req.Vault, cfg.BSCTreasuryContract) {
+		return "", nil, errors.New("vault nao autorizado")
+	}
+	if !common.IsHexAddress(req.Token) {
+		return "", nil, errors.New("token EVM invalido")
+	}
+	if strings.TrimSpace(cfg.BSCUSDTContract) == "" {
+		return "", nil, errors.New("BSC_USDT_CONTRACT obrigatorio")
+	}
+	if !strings.EqualFold(req.Token, cfg.BSCUSDTContract) {
+		return "", nil, errors.New("token divergente do BSC_USDT_CONTRACT")
+	}
+	if len(cfg.AllowedTokenContracts) > 0 && !cfg.AllowedTokenContracts[strings.ToUpper(strings.TrimSpace(req.Token))] {
+		return "", nil, errors.New("token contract nao permitido")
+	}
+	if !common.IsHexAddress(req.Recipient) {
+		return "", nil, errors.New("recipient EVM invalido")
+	}
+	amount, ok := new(big.Int).SetString(strings.TrimSpace(req.AmountRaw), 10)
+	if !ok || amount.Sign() <= 0 {
+		return "", nil, errors.New("amountRaw invalido")
+	}
+	if strings.TrimSpace(req.PolicyVersion) != settlementPolicyVersion {
+		return "", nil, errors.New("policyVersion invalida")
+	}
+	expiresAt, err := time.Parse(time.RFC3339, req.ExpiresAt)
+	if err != nil {
+		expiresAt, err = time.Parse(time.RFC3339Nano, req.ExpiresAt)
+	}
+	if err != nil {
+		return "", nil, errors.New("expiresAt invalido")
+	}
+	if !time.Now().Before(expiresAt) {
+		return "", nil, errors.New("SETTLEMENT_AUTHORIZATION_EXPIRED")
+	}
+	expected, err := settlementOperationID(int64(req.ChainID), req.Vault, req.SettlementIntentID, req.Token, req.Recipient, amount)
+	if err != nil {
+		return "", nil, err
+	}
+	if common.HexToHash(req.OperationID) != expected {
+		return "", nil, errors.New("SETTLEMENT_OPERATION_ID_MISMATCH")
+	}
+	return network, amount, nil
+}
+
+func executeEVMSettlement(ctx context.Context, cfg *SignerConfig, store signerStore, req SettlementExecuteRequest, network string, amount *big.Int) (TransferResponse, error) {
+	privateKey, err := crypto.HexToECDSA(strings.TrimPrefix(cfg.EVMPrivateKey, "0x"))
+	if err != nil {
+		return TransferResponse{}, fmt.Errorf("EVM_PRIVATE_KEY invalida: %w", err)
+	}
+	from := crypto.PubkeyToAddress(privateKey.PublicKey)
+	if cfg.AllowSimulation {
+		hash := crypto.Keccak256Hash([]byte(req.IdempotencyKey + req.OperationID + req.Vault)).Hex()
+		return TransferResponse{TxHash: hash, From: from.Hex(), Network: network}, nil
+	}
+	fleet := cfg.RPCFleet
+	if fleet == nil {
+		fleet = newRPCFleet(cfg.RPCURLs)
+	}
+	var lastErr error
+	for _, handle := range fleet.sendCandidates(len(cfg.RPCURLs)) {
+		start := time.Now()
+		client, err := ethclient.DialContext(ctx, handle.url)
+		if err != nil {
+			fleet.recordFailure(handle.id, classifyRPCFailure(err))
+			lastErr = fmt.Errorf("%s indisponivel: %w", handle.name, err)
+			continue
+		}
+		resp, err := executeEVMSettlementWithClient(ctx, cfg, store, req, network, client, privateKey, from, amount)
+		client.Close()
+		if err != nil {
+			fleet.recordFailure(handle.id, classifyRPCFailure(err))
+			lastErr = fmt.Errorf("%s falhou: %w", handle.name, err)
+			continue
+		}
+		fleet.recordSuccess(handle.id, time.Since(start))
+		return resp, nil
+	}
+	if lastErr == nil {
+		lastErr = errors.New("nenhum RPC BSC disponivel")
+	}
+	return TransferResponse{}, lastErr
+}
+
+func executeEVMSettlementWithClient(ctx context.Context, cfg *SignerConfig, store signerStore, req SettlementExecuteRequest, network string, client *ethclient.Client, privateKey *ecdsa.PrivateKey, from common.Address, amount *big.Int) (TransferResponse, error) {
+	chainID, err := client.ChainID(ctx)
+	if err != nil {
+		return TransferResponse{}, fmt.Errorf("falha ao obter chain id: %w", err)
+	}
+	if chainID.Cmp(new(big.Int).SetUint64(req.ChainID)) != 0 {
+		return TransferResponse{}, fmt.Errorf("chain id inesperado para settlement: %s", chainID.String())
+	}
+	chainPending, err := client.PendingNonceAt(ctx, from)
+	if err != nil {
+		return TransferResponse{}, fmt.Errorf("falha ao obter nonce: %w", err)
+	}
+	nonce, err := store.ReserveChainNonce(ctx, from.Hex(), network, chainPending)
+	if err != nil {
+		return TransferResponse{}, fmt.Errorf("falha ao reservar nonce: %w", err)
+	}
+	_ = store.RecordCustodyEvent(ctx, CustodyEvent{Kind: "nonce_reserved", Mode: cfg.CustodyMode, Wallet: from.Hex(), Data: map[string]any{"nonce": nonce, "network": network, "type": "settlement", "operationId": req.OperationID}})
+	gasPrice, err := client.SuggestGasPrice(ctx)
+	if err != nil {
+		return TransferResponse{}, fmt.Errorf("falha ao obter gas price: %w", err)
+	}
+	data, err := vaultPayoutData(common.HexToHash(req.OperationID), common.HexToAddress(req.Token), common.HexToAddress(req.Recipient), amount)
+	if err != nil {
+		return TransferResponse{}, err
+	}
+	vault := common.HexToAddress(req.Vault)
+	gasLimit, err := client.EstimateGas(ctx, ethereum.CallMsg{From: from, To: &vault, Data: data})
+	if err != nil || gasLimit == 0 {
+		gasLimit = 350000
+	}
+	tx := types.NewTransaction(nonce, vault, big.NewInt(0), gasLimit, gasPrice, data)
+	signed, err := types.SignTx(tx, types.LatestSignerForChainID(chainID), privateKey)
+	if err != nil {
+		_ = store.MarkChainNonceFailed(ctx, from.Hex(), network, nonce, err.Error())
+		return TransferResponse{}, fmt.Errorf("falha ao assinar tx: %w", err)
+	}
+	if err := client.SendTransaction(ctx, signed); err != nil {
+		_ = store.MarkChainNonceFailed(ctx, from.Hex(), network, nonce, err.Error())
+		_ = store.CreateSignerTransaction(ctx, SignerTransaction{
+			IdempotencyKey: req.IdempotencyKey,
+			WalletFrom:     from.Hex(),
+			WalletTo:       req.Vault,
+			Token:          req.Token,
+			Amount:         req.AmountRaw,
+			Network:        network,
+			Nonce:          nonce,
+			TxHash:         signed.Hash().Hex(),
+			Status:         "failed",
+			Reason:         err.Error(),
+		})
+		return TransferResponse{}, fmt.Errorf("falha ao transmitir tx: %w", err)
+	}
+	_ = store.MarkChainNonceSubmitted(ctx, from.Hex(), network, nonce, signed.Hash().Hex())
+	_ = store.CreateSignerTransaction(ctx, SignerTransaction{
+		IdempotencyKey: req.IdempotencyKey,
+		WalletFrom:     from.Hex(),
+		WalletTo:       req.Vault,
+		Token:          req.Token,
+		Amount:         req.AmountRaw,
+		Network:        network,
+		Nonce:          nonce,
+		TxHash:         signed.Hash().Hex(),
+		Status:         "submitted",
+	})
+	_ = store.RecordCustodyEvent(ctx, CustodyEvent{Kind: "tx_submitted", Mode: cfg.CustodyMode, TxHash: signed.Hash().Hex(), Wallet: from.Hex(), Data: map[string]any{"type": "settlement", "operationId": req.OperationID}})
+	return TransferResponse{TxHash: signed.Hash().Hex(), From: from.Hex(), Network: network}, nil
+}
 
 func executeTransfer(ctx context.Context, cfg *SignerConfig, store signerStore, req TransferRequest) (TransferResponse, error) {
 	network := requestedNetwork(cfg, req)
@@ -972,6 +1179,86 @@ func erc20TransferData(to common.Address, amount *big.Int) []byte {
 	amountBytes := amount.Bytes()
 	copy(data[68-len(amountBytes):], amountBytes)
 	return data
+}
+
+func settlementOperationID(chainID int64, vaultAddress, settlementIntentID, tokenAddress, recipientAddress string, amountRaw *big.Int) (common.Hash, error) {
+	if chainID <= 0 {
+		return common.Hash{}, errors.New("chainId invalido")
+	}
+	if !common.IsHexAddress(vaultAddress) {
+		return common.Hash{}, errors.New("vault EVM invalido")
+	}
+	if !common.IsHexAddress(tokenAddress) {
+		return common.Hash{}, errors.New("token EVM invalido")
+	}
+	if !common.IsHexAddress(recipientAddress) {
+		return common.Hash{}, errors.New("recipient EVM invalido")
+	}
+	if amountRaw == nil || amountRaw.Sign() <= 0 {
+		return common.Hash{}, errors.New("amountRaw invalido")
+	}
+	uint256Type, err := abi.NewType("uint256", "", nil)
+	if err != nil {
+		return common.Hash{}, err
+	}
+	addressType, err := abi.NewType("address", "", nil)
+	if err != nil {
+		return common.Hash{}, err
+	}
+	bytes32Type, err := abi.NewType("bytes32", "", nil)
+	if err != nil {
+		return common.Hash{}, err
+	}
+	args := abi.Arguments{
+		{Type: uint256Type},
+		{Type: addressType},
+		{Type: bytes32Type},
+		{Type: addressType},
+		{Type: addressType},
+		{Type: uint256Type},
+	}
+	encoded, err := args.Pack(
+		new(big.Int).SetInt64(chainID),
+		common.HexToAddress(vaultAddress),
+		crypto.Keccak256Hash([]byte(settlementIntentID)),
+		common.HexToAddress(tokenAddress),
+		common.HexToAddress(recipientAddress),
+		amountRaw,
+	)
+	if err != nil {
+		return common.Hash{}, err
+	}
+	return crypto.Keccak256Hash(encoded), nil
+}
+
+func vaultPayoutData(operationID common.Hash, token, recipient common.Address, amount *big.Int) ([]byte, error) {
+	bytes32Type, err := abi.NewType("bytes32", "", nil)
+	if err != nil {
+		return nil, err
+	}
+	addressType, err := abi.NewType("address", "", nil)
+	if err != nil {
+		return nil, err
+	}
+	uint256Type, err := abi.NewType("uint256", "", nil)
+	if err != nil {
+		return nil, err
+	}
+	args := abi.Arguments{
+		{Type: bytes32Type},
+		{Type: addressType},
+		{Type: addressType},
+		{Type: uint256Type},
+	}
+	encoded, err := args.Pack(operationID, token, recipient, amount)
+	if err != nil {
+		return nil, err
+	}
+	selector := crypto.Keccak256([]byte("payout(bytes32,address,address,uint256)"))[:4]
+	data := make([]byte, 0, len(selector)+len(encoded))
+	data = append(data, selector...)
+	data = append(data, encoded...)
+	return data, nil
 }
 
 func decodeHexData(value string) ([]byte, error) {
