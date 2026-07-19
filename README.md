@@ -18,6 +18,55 @@ GET /healthz
 GET /readyz
 ```
 
+## Testes adversariais e latencia
+
+Sem contratos em producao, a validacao critica fica no signer: HMAC, nonce, idempotencia, custody guard, allowlist de token, limite de valor e broadcast. A pasta `contracts/` contem os scripts de smoke porque ja tem Node instalado e serve como laboratorio operacional.
+
+Smoke seguro, sem envio on-chain:
+
+```powershell
+cd C:\Users\Paulo\Desktop\payment-gateway\contracts
+$env:SIGNER_URL="https://transaction-signer-production-8394.up.railway.app"
+$env:SIGNER_HMAC_SECRET="mesmo segredo do signer"
+npm run smoke:signer-adversarial
+```
+
+Esse teste deve terminar com todos os casos `PASS` e um resumo:
+
+```text
+Latency summary:
+count=16 min=...ms avg=...ms p50=...ms p55=...ms p75=...ms p90=...ms p95=...ms p99=...ms max=...ms
+```
+
+Casos cobertos:
+
+- `/healthz` e `/readyz`;
+- HMAC ausente/invalido;
+- timestamp expirado;
+- payload alterado depois da assinatura;
+- replay de nonce;
+- replay paralelo do mesmo nonce em primeiro uso;
+- replay paralelo de nonce ja consumido, que deve rejeitar 10/10 tentativas;
+- token fora da allowlist;
+- valor acima de `SIGNER_MAX_TRANSFER_AMOUNT`;
+- rede invalida;
+- recipient invalido;
+- idempotency key repetida.
+
+Teste live/testnet com envio real:
+
+```powershell
+cd C:\Users\Paulo\Desktop\payment-gateway\contracts
+$env:SIGNER_URL="http://127.0.0.1:4010"
+$env:SIGNER_HMAC_SECRET="mesmo segredo do signer"
+$env:SIGNER_LIVE_TEST_TO="0xWalletDeTeste"
+$env:SIGNER_LIVE_TEST_TOKEN="0xTokenDeTeste"
+$env:SIGNER_LIVE_TEST_AMOUNT="0.01"
+npm run smoke:signer-live-testnet -- --i-understand-this-sends-funds
+```
+
+O teste live imprime `status`, `latency_ms` e a resposta do signer com `txHash` quando a transacao foi submetida. Use somente testnet ou wallet com saldo pequeno.
+
 Variaveis obrigatorias:
 
 ```env
