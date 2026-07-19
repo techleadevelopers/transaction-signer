@@ -17,7 +17,9 @@ import (
 	"time"
 
 	"payment-gateway/internal/security"
+	"payment-gateway/internal/transactions"
 
+	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -42,6 +44,27 @@ type ContractCallRequest struct {
 	Amount          string `json:"amount,omitempty"`
 	TokenContract   string `json:"tokenContract,omitempty"`
 	DerivationIndex *int   `json:"derivationIndex,omitempty"`
+}
+
+type SettlementExecuteRequest struct {
+	OperationID        string `json:"operationId"`
+	SettlementIntentID string `json:"settlementIntentId"`
+	OrderID            string `json:"orderId"`
+	Side               string `json:"side"`
+	Network            string `json:"network"`
+	ChainID            uint64 `json:"chainId"`
+	Vault              string `json:"vault"`
+	Token              string `json:"token"`
+	Recipient          string `json:"recipient"`
+	AmountRaw          string `json:"amountRaw"`
+	SourceChannel      string `json:"sourceChannel"`
+	PolicyVersion      string `json:"policyVersion"`
+	NetworkPolicy      string `json:"networkPolicy"`
+	RiskPolicy         string `json:"riskPolicy"`
+	ContractVersion    string `json:"contractVersion"`
+	AuthorizedAt       string `json:"authorizedAt"`
+	ExpiresAt          string `json:"expiresAt"`
+	IdempotencyKey     string `json:"idempotencyKey"`
 }
 
 type TransferResponse struct {
