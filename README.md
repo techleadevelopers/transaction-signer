@@ -35,7 +35,7 @@ Esse teste deve terminar com todos os casos `PASS` e um resumo:
 
 ```text
 Latency summary:
-count=16 min=...ms avg=...ms p50=...ms p55=...ms p75=...ms p90=...ms p95=...ms p99=...ms max=...ms
+count=18 min=...ms avg=...ms p50=...ms p55=...ms p75=...ms p90=...ms p95=...ms p99=...ms max=...ms
 ```
 
 Casos cobertos:
@@ -52,6 +52,29 @@ Casos cobertos:
 - rede invalida;
 - recipient invalido;
 - idempotency key repetida.
+
+Flood opcional de HMAC invalido:
+
+```powershell
+$env:FLOOD_INVALID_HMAC="100"
+npm run smoke:signer-adversarial
+```
+
+Com flood habilitado o `count` aumenta, por exemplo `count=19`, e deve aparecer:
+
+```text
+PASS invalid HMAC flood is rejected (100 requests)
+```
+
+Runbook antes de considerar o signer pronto:
+
+- Rodar smoke adversarial default e com `FLOOD_INVALID_HMAC=100`.
+- Rodar concorrencia maior com `$env:PARALLEL_IDEMPOTENCY="50"`.
+- Reiniciar o signer e repetir um replay com nonce/idempotency usados para validar persistencia em Redis/Postgres.
+- Simular Redis indisponivel: signer deve falhar fechado com erro de nonce/storage, sem assinar.
+- Simular Postgres indisponivel: signer deve falhar fechado em idempotencia/nonce lifecycle.
+- Simular RPC indisponivel: signer pode autenticar a chamada, mas deve retornar erro de broadcast/estimate sem criar envio confirmado.
+- Validar alertas/logs para `custody guard lockdown`, `nonce validation failed`, `idempotency key em processamento`, `token contract nao permitido` e `amount acima do limite`.
 
 Teste live/testnet com envio real:
 
