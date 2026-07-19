@@ -98,9 +98,6 @@ func (c *SignerConfig) ValidateProduction() error {
 	if len(c.AllowedTokenContracts) == 0 {
 		return fmt.Errorf("SIGNER_ALLOWED_TOKEN_CONTRACTS deve fixar contratos permitidos em producao")
 	}
-	if strings.TrimSpace(c.BSCTreasuryContract) == "" {
-		return fmt.Errorf("BSC_TREASURY_CONTRACT obrigatorio em producao")
-	}
 
 	if len(strings.TrimSpace(c.Security.HMACSecret)) < 32 {
 		return fmt.Errorf("HMAC_SECRET deve ter pelo menos 32 caracteres em producao")
