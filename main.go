@@ -147,6 +147,7 @@ func main() {
 				"maxDailyOutflow":      cfg.TreasuryMaxDailyOut,
 				"lockdownDailyOutflow": cfg.TreasuryLockThreshold,
 			},
+			"settlementVaultConfigured": strings.TrimSpace(cfg.BSCTreasuryContract) != "",
 		}
 		if locked {
 			ready["lockReason"] = lockReason
@@ -155,9 +156,9 @@ func main() {
 			ready["ok"] = false
 			ready["storage"] = err.Error()
 		}
-		if (cfg.DefaultNetwork == "BSC" || cfg.DefaultNetwork == "EVM") && (len(cfg.RPCURLs) == 0 || cfg.BSCUSDTContract == "" || cfg.BSCTreasuryContract == "") {
+		if (cfg.DefaultNetwork == "BSC" || cfg.DefaultNetwork == "EVM") && (len(cfg.RPCURLs) == 0 || cfg.BSCUSDTContract == "") {
 			ready["ok"] = false
-			ready["bsc"] = "BSC_RPC_URLS, BSC_USDT_CONTRACT e BSC_TREASURY_CONTRACT obrigatorios"
+			ready["bsc"] = "BSC_RPC_URLS e BSC_USDT_CONTRACT obrigatorios"
 		}
 		status := http.StatusOK
 		if ready["ok"] == false {
@@ -216,11 +217,6 @@ func main() {
 			http.Error(w, "metodo nao permitido", http.StatusMethodNotAllowed)
 			return
 		}
-		if cfg.IsProduction() {
-			http.Error(w, "DIRECT_TRANSFER_DISABLED", http.StatusForbidden)
-			return
-		}
-
 		if locked, reason := custodyGuard.Locked(); locked {
 			slog.Error("transferencia bloqueada por custody guard", "reason", reason)
 			http.Error(w, "custody guard lockdown", http.StatusLocked)
